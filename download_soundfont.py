@@ -7,13 +7,15 @@ import os
 import urllib.request
 import sys
 
+from soundfont import assets_soundfont_path
+
 def download_soundfont():
     # NOWY LINK (Mirror z GitHuba - publiczny i stabilny)
     url = "https://github.com/urish/cinto/raw/master/media/FluidR3_GM.sf2"
     
-    folder = "assets"
-    filename = "FluidR3_GM.sf2"
-    path = os.path.join(folder, filename)
+    path = assets_soundfont_path()
+    folder = os.path.dirname(path)
+    filename = os.path.basename(path)
 
     if not os.path.exists(folder):
         os.makedirs(folder)

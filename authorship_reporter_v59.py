@@ -16,6 +16,14 @@ import os
 from amocore_v59 import AXES_LIST, EPHEMERAL_AXES, PERSISTENT_AXES
 
 
+def cosine_similarity(v1, v2) -> float:
+    """Podobieństwo kosinusowe. Zerowy wektor daje 0."""
+    n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
+    if n1 > 0 and n2 > 0:
+        return float(np.dot(v1, v2) / (n1 * n2))
+    return 0.0
+
+
 class AuthorshipReporter:
     """
     Analizator porównawczy stylów muzycznych.
@@ -71,25 +79,18 @@ class AuthorshipReporter:
         persistent_idx = [AXES_LIST.index(a) for a in PERSISTENT_AXES]
         ephemeral_idx = [AXES_LIST.index(a) for a in EPHEMERAL_AXES]
         
-        # Funkcja pomocnicza do obliczania podobieństwa
-        def cosine_sim(v1, v2):
-            n1, n2 = np.linalg.norm(v1), np.linalg.norm(v2)
-            if n1 > 0 and n2 > 0:
-                return np.dot(v1, v2) / (n1 * n2)
-            return 0.0
-        
         # 1. Podobieństwo ogólne
-        sim_total = cosine_sim(vec_a, vec_b)
+        sim_total = cosine_similarity(vec_a, vec_b)
         
         # 2. Podobieństwo na osiach TRWAŁYCH (pamięć głęboka)
         vec_a_pers = vec_a[persistent_idx]
         vec_b_pers = vec_b[persistent_idx]
-        sim_persistent = cosine_sim(vec_a_pers, vec_b_pers)
+        sim_persistent = cosine_similarity(vec_a_pers, vec_b_pers)
         
         # 3. Podobieństwo na osiach EFEMERYCZNYCH
         vec_a_eph = vec_a[ephemeral_idx]
         vec_b_eph = vec_b[ephemeral_idx]
-        sim_ephemeral = cosine_sim(vec_a_eph, vec_b_eph)
+        sim_ephemeral = cosine_similarity(vec_a_eph, vec_b_eph)
         
         # WERDYKT - bazujemy głównie na osiach TRWAŁYCH!
         if sim_persistent > 0.92:

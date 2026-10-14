@@ -21,11 +21,10 @@ import sys
 import matplotlib
 matplotlib.use('Agg')  # Backend bez GUI - zapobiega konfliktom z Tkinter
 
-from amocore_v59 import EriAmoCore, SoulStateLogger, AXES_LIST, EPHEMERAL_AXES
-from music_analyzer_v59 import MusicAnalyzer
-from soul_composer_v59 import SoulComposerV59
-from data_loader_v59 import ExternalKnowledgeLoader
+from amocore_v59 import AXES_LIST, EPHEMERAL_AXES
 from genre_definitions import list_genres
+from instruments import list_instrument_names
+from session import EriAmoSession
 
 # Dark mode
 ctk.set_appearance_mode("Dark")
@@ -39,32 +38,13 @@ class EriAmoBrain(threading.Thread):
     żeby nie blokować GUI.
     """
     
-    def __init__(self, core, cmd_queue, resp_queue):
+    def __init__(self, session, cmd_queue, resp_queue):
         super().__init__(daemon=True)
-        self.core = core
+        self.session = session
+        self.core = session.core
         self.cmd_queue = cmd_queue
         self.resp_queue = resp_queue
         self.running = True
-        
-        # Lazy initialization - nie importuj wizualizera od razu
-        self.logger = SoulStateLogger()
-        self.analyzer = MusicAnalyzer(core, self.logger)
-        self.composer = SoulComposerV59(core, self.logger)
-        self.loader = None  # Lazy load
-        self.visualizer = None  # Lazy load
-
-    def _get_loader(self):
-        """Lazy initialization loadera."""
-        if self.loader is None:
-            self.loader = ExternalKnowledgeLoader()
-        return self.loader
-
-    def _get_visualizer(self):
-        """Lazy initialization wizualizera."""
-        if self.visualizer is None:
-            from visualizer_v59 import SoulVisualizerV59
-            self.visualizer = SoulVisualizerV59()
-        return self.visualizer
 
     def run(self):
         self.core.log("[SYSTEM] Wątek Mózgu: Aktywny", "CYAN")
@@ -89,8 +69,8 @@ class EriAmoBrain(threading.Thread):
                 
                 elif cmd_type == 'DECAY':
                     cycles = task.get('cycles', 1)
-                    self.core.apply_emotion_decay(cycles)
-                    self.resp_queue.put({"status": "LOG", "msg": f"Wygaszanie: {cycles} cykli"})
+                    self.session.decay(cycles)
+                    self.resp_queue.put({"status": "LOG", "msg": f"Wygaszanie: {cycles} cykli (zapisane)"})
                 
                 # Zawsze aktualizuj stan po operacji
                 self.send_soul_update()
@@ -111,14 +91,13 @@ class EriAmoBrain(threading.Thread):
         
         if task.get('artist'):
             try:
-                loader = self._get_loader()
-                web_features = loader.get_context_from_web(task['artist'], title)
-                features.extend(web_features)
+                web_features = self.session.loader.get_context_from_web(task['artist'], title)
+                features.extend(web_features or [])
             except Exception as e:
                 self.resp_queue.put({"status": "LOG", "msg": f"Web: {e}"})
         
         mode = "!teach" if task['mode'] == 'full' else "!simulate"
-        self.analyzer.analyze_and_shift(features, title, mode=mode)
+        self.session.teach(features, title, mode=mode)
         self.resp_queue.put({"status": "LOG", "msg": f"Analiza: {title}"})
 
     def _handle_compose(self, task):
@@ -126,7 +105,7 @@ class EriAmoBrain(threading.Thread):
         genre = task['genre']
         instrument = task.get('instrument', None)  # Opcjonalny instrument
         try:
-            paths = self.composer.compose_new_work(genre, instrument_override=instrument)
+            paths = self.session.compose(genre, instrument=instrument)
             self.resp_queue.put({
                 "status": "SUCCESS", 
                 "msg": f"Skomponowano {genre}!" + (f" ({instrument})" if instrument else ""), 
@@ -138,8 +117,7 @@ class EriAmoBrain(threading.Thread):
     def _handle_report(self):
         """Obsługa generowania raportu."""
         try:
-            vis = self._get_visualizer()
-            paths = vis.create_complete_report()
+            paths = self.session.visualizer.create_complete_report()
             self.resp_queue.put({"status": "REPORT_READY", "paths": paths})
         except Exception as e:
             self.resp_queue.put({"status": "ERROR", "msg": f"Raport: {e}"})
@@ -172,11 +150,11 @@ class EriAmoApp(ctk.CTk):
         self.cmd_queue = queue.Queue()
         self.resp_queue = queue.Queue()
         
-        # Inicjalizacja rdzenia (w głównym wątku)
-        self.core = EriAmoCore()
+        self.session = EriAmoSession()
+        self.core = self.session.core
         
         # Start wątku roboczego
-        self.brain = EriAmoBrain(self.core, self.cmd_queue, self.resp_queue)
+        self.brain = EriAmoBrain(self.session, self.cmd_queue, self.resp_queue)
         self.brain.start()
         
         # Buduj UI
@@ -247,7 +225,7 @@ class EriAmoApp(ctk.CTk):
                 pbar.configure(progress_color="#7f8c8d")  # Szary
             elif axis == 'affections':
                 pbar.configure(progress_color="#9b59b6")  # Fioletowy
-            elif axis == 'etyka':
+            elif axis == 'improwizacja':
                 pbar.configure(progress_color="#27ae60")  # Zielony
             elif axis in ['logika', 'wiedza']:
                 pbar.configure(progress_color="#3498db")  # Niebieski
@@ -375,9 +353,7 @@ class EriAmoApp(ctk.CTk):
         )
         lbl_instr.pack(pady=(15, 5))
         
-        instruments = ["Auto", "PIANO", "ORGAN", "GUITAR", "DISTORTION", "BASS",
-                      "STRINGS", "CHOIR", "TRUMPET", "BRASS", "SAX", 
-                      "FLUTE", "PAD", "SYNTH", "SITAR"]
+        instruments = ["Auto"] + list_instrument_names()
         self.instrument_var = ctk.StringVar(value="Auto")
         
         self.combo_instrument = ctk.CTkComboBox(
@@ -546,6 +522,7 @@ class EriAmoApp(ctk.CTk):
         # Zatrzymaj wątek roboczy
         self.cmd_queue.put({'type': 'STOP'})
         self.brain.join(timeout=2.0)
+        self.session.shutdown()
         
         # Zamknij okno
         self.destroy()

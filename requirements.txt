@@ -1,0 +1,9 @@
+numpy
+pandas
+matplotlib
+plotly
+music21
+musicbrainzngs
+customtkinter
+midi2audio
+pydub

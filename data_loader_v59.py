@@ -168,7 +168,7 @@ class ExternalKnowledgeLoader:
         if not isinstance(raw_bytes, bytes): return str(raw_bytes)
         for enc in ['utf-8', 'cp1250', 'latin-1']:
             try: return raw_bytes.decode(enc).strip()
-            except: continue
+            except UnicodeDecodeError: continue
         return raw_bytes.decode('utf-8', errors='ignore').strip()
 
     def _analyze_instruments(self, score) -> list:
@@ -201,18 +201,32 @@ class ExternalKnowledgeLoader:
             
         return list(features)
 
-    def parse_music_file(self, file_path: str) -> list:
-        """Główna metoda analizy pliku."""
+    def open_score(self, file_path: str):
+        """Jedno wczytanie pliku. Zwraca partyturę albo None."""
         if not MUSIC21_AVAIL:
             print("[NUTY] Music21 niedostępne")
-            return []
-        
-        features = []
+            return None
         print(f"[NUTY] Analizuję: {os.path.basename(file_path)}...")
-        
         try:
-            score = music21.converter.parse(file_path)
-            
+            return music21.converter.parse(file_path)
+        except Exception as e:
+            print(f"[NUTY] Krytyczny błąd: {e}")
+            return None
+
+    def parse_music_file(self, file_path: str) -> list:
+        """Główna metoda analizy pliku."""
+        score = self.open_score(file_path)
+        if score is None:
+            return []
+        return self.features_from_score(score)
+
+    def features_from_score(self, score) -> list:
+        """Cechy ontologiczne z gotowej partytury."""
+        if score is None:
+            return []
+
+        features = []
+        try:
             # 1. INSTRUMENTY (NOWOŚĆ!)
             inst_features = self._analyze_instruments(score)
             features.extend(inst_features)
@@ -224,7 +238,8 @@ class ExternalKnowledgeLoader:
                     if evt.isText and isinstance(evt.data, bytes):
                         decoded = self._decode_midi_text(evt.data)
                         if len(decoded) > 2: extracted_text.append(decoded)
-            except: pass
+            except Exception:
+                pass
             
             # TextBoxes
             for tb in score.flatten().getElementsByClass('TextBox'):
@@ -258,10 +273,11 @@ class ExternalKnowledgeLoader:
                     elif key.mode == 'major': features.append("RADOSC")
                     
                 # Prosta detekcja chaosu/złożoności
-                notes_count = len(score.flat.notes)
+                notes_count = len(score.flatten().notes)
                 if notes_count > 1000: features.append("EPIC") # Długi/gęsty utwór
                 
-            except: pass
+            except Exception:
+                pass
             
             final = list(set(features))
             print(f"[NUTY] Wynik końcowy: {final}")

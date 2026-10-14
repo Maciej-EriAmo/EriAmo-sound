@@ -81,7 +81,7 @@ GENRE_DEFINITIONS = {
         "opis": "Msza żałobna. Wzniosłość i transcendencja.",
         "f_intencja_wektor": {
             "affections": -5.0,  # Głęboki żal (TRWAŁE)
-            "etyka": 3.0,        # Refleksja moralna
+            "improwizacja": -3.0,  # Porządek liturgiczny
             "przestrzen": 4.0,   # Sakralność
             "wiedza": 4.0,       # Tradycja liturgiczna
             "kreacja": 4.0
@@ -123,6 +123,18 @@ GENRE_DEFINITIONS = {
         }
     },
     
+    "POWER_METAL": {
+        "opis": "Wysoka energia, wzniosłość, szybkie tempo.",
+        "f_intencja_wektor": {
+            "affections": 6.0,
+            "byt": 4.0,
+            "czas": 5.0,
+            "improwizacja": -2.0,
+            "kreacja": 4.0,
+            "emocje": 4.0
+        }
+    },
+
     "HEAVY_METAL": {
         "opis": "Ciężki metal. Agresja i moc.",
         "f_intencja_wektor": {
@@ -211,7 +223,7 @@ GENRE_DEFINITIONS = {
             "affections": 2.0,   # Nostalgia (TRWAŁA)
             "logika": 1.0,       # Prosta forma
             "emocje": 2.0,
-            "etyka": 2.0         # Wspólnota
+            "improwizacja": -2.0  # Tradycja, mniejsza swoboda
         }
     },
     

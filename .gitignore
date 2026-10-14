@@ -11,4 +11,5 @@ data/
 *.mp3
 *.wav
 *.mid
+*.sf2
 *_tab.txt

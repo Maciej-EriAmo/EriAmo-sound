@@ -2,6 +2,20 @@
 
 **System Świadomość:** Zdolność systemu do sterowania samym sobą w oparciu o model otoczenia.
 
+## Uruchomienie (Windows)
+
+```powershell
+cd $HOME\EriAmo-sound
+python -m pip install -r requirements.txt
+python download_soundfont.py
+python main_v59.py
+python main_gui_v59.py
+```
+
+SoundFont jest szukany w `assets/FluidR3_GM.sf2`. Inną ścieżkę ustawisz zmienną `ERIAMO_SOUNDFONT`. Render WAV wymaga programu FluidSynth w PATH i pakietu `midi2audio`. OGG i FLAC dodatkowo wymagają `pydub`. Bez FluidSynth zostaje MIDI.
+
+Testy bez audio: `python -m unittest tests.test_eriamo -v`
+
 ---
 
 ## 🧠 Architektura Duszy (Model 5.9)

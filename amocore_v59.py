@@ -54,6 +54,7 @@ import threading
 import time
 import csv
 import os
+import tempfile
 import hashlib
 import json
 from dataclasses import dataclass, field
@@ -84,6 +85,25 @@ PERSISTENT_AXES = ["affections", "logika", "wiedza", "kreacja", "byt", "przestrz
 
 # Próg Kompresji Ontologicznej
 ONTOLOGICAL_THRESHOLD = 0.98
+
+def _atomic_write_json(path: str, payload) -> None:
+    """Zapis JSON przez plik tymczasowy i podmianę, żeby przerwanie nie zostało w połowie pliku."""
+    directory = os.path.dirname(os.path.abspath(path))
+    os.makedirs(directory, exist_ok=True)
+    fd, tmp_path = tempfile.mkstemp(prefix=".eriamo-", suffix=".tmp", dir=directory)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, ensure_ascii=False)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            os.remove(tmp_path)
+        except OSError:
+            pass
+        raise
+
 
 # =============================================================================
 # SYSTEM SNU - DWUWARSTWOWA PAMIĘĆ MUZYCZNA
@@ -145,6 +165,7 @@ class MusicMemory:
             sleep_interval: Interwał snu w sekundach (domyślnie 300 = 5 min)
         """
         os.makedirs(self.DATA_DIR, exist_ok=True)
+        self._lock = threading.RLock()
         
         # Warstwa 1: Doświadczenia (lista słowników)
         self.H_log = []
@@ -187,14 +208,13 @@ class MusicMemory:
             self.D_Map = {}
     
     def _save_memory(self):
-        """Zapisuje pamięć do plików."""
-        try:
-            with open(self.H_LOG_PATH, 'w', encoding='utf-8') as f:
-                json.dump(self.H_log[-1000:], f, indent=2, ensure_ascii=False)  # Max 1000 doświadczeń
-            with open(self.D_MAP_PATH, 'w', encoding='utf-8') as f:
-                json.dump(self.D_Map, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            print(f"\033[91m[MEMORY] Błąd zapisu: {e}\033[0m")
+        """Zapisuje pamięć do plików. Zamek trzyma spójny odczyt H_log i D_Map."""
+        with self._lock:
+            try:
+                _atomic_write_json(self.H_LOG_PATH, self.H_log[-1000:])
+                _atomic_write_json(self.D_MAP_PATH, self.D_Map)
+            except Exception as e:
+                print(f"\033[91m[MEMORY] Błąd zapisu: {e}\033[0m")
     
     def _start_sleep_cycle(self):
         """Uruchamia cykl snu w osobnym wątku."""
@@ -217,6 +237,17 @@ class MusicMemory:
         3. Dodaje/wzmacnia w D_Map
         4. Deduplikuje podobne wzorce
         """
+        with self._lock:
+            self._sleep_locked()
+
+    def _sleep_locked(self):
+        """Konsolidacja w tle. Wołane tylko przy trzymanym self._lock."""
+        if not self.running:
+            return
+        self._consolidate_locked()
+
+    def _consolidate_locked(self):
+        """Scala świeże doświadczenia do D_Map. Działa także przy zamykaniu."""
         if self.is_sleeping:
             return
         
@@ -290,6 +321,9 @@ class MusicMemory:
         for feat in ['repetition_density', 'leap_ratio', 'rhythmic_regularity', 'syncopation_feel']:
             val = features.get(feat, 0.5)
             parts.append(f"{feat[:3]}:{quantize(val)}")
+        tonic_pc = int(round(float(features.get("key_tonic", 0)) * 11)) % 12
+        mode = "m" if float(features.get("key_mode", 1)) < 0.5 else "M"
+        parts.append(f"ton:{tonic_pc}{mode}")
         
         return "|".join(parts)
     
@@ -332,20 +366,21 @@ class MusicMemory:
             features: Słownik cech muzycznych
             source: Źródło (np. nazwa pliku MIDI)
         """
-        experience = {
-            'timestamp': datetime.now().isoformat(),
-            'features': features,
-            'source': source,
-            'vector': self._features_to_vector(features)
-        }
-        
-        self.H_log.append(experience)
-        self.experiences_since_sleep += 1
-        
-        # Auto-sen jeśli dużo doświadczeń
-        if self.experiences_since_sleep > 10:
-            print(f"\033[93m[MEMORY] Dużo nowych doświadczeń - wymuszam sen...\033[0m")
-            self._sleep()
+        with self._lock:
+            experience = {
+                'timestamp': datetime.now().isoformat(),
+                'features': features,
+                'source': source,
+                'vector': self._features_to_vector(features)
+            }
+            
+            self.H_log.append(experience)
+            self.experiences_since_sleep += 1
+            
+            # Auto-sen jeśli dużo doświadczeń
+            if self.experiences_since_sleep > 10:
+                print(f"\033[93m[MEMORY] Dużo nowych doświadczeń - wymuszam sen...\033[0m")
+                self._sleep()
     
     def _features_to_vector(self, features: dict) -> list:
         """Konwertuje cechy do wektora numerycznego."""
@@ -358,13 +393,16 @@ class MusicMemory:
         Używane przez kompozytor do generowania muzyki.
         Ważone średnie cech na podstawie wag wzorców.
         """
+        with self._lock:
+            return self._consolidated_style_unlocked()
+
+    def _consolidated_style_unlocked(self) -> dict:
         if not self.D_Map:
-            return {f: 0.5 for f in self.MUSICAL_FEATURES}  # Domyślne neutralne
+            return {"has_data": False}
         
-        # Ważona średnia wszystkich wzorców
         total_weight = sum(p['weight'] for p in self.D_Map.values())
         if total_weight == 0:
-            return {f: 0.5 for f in self.MUSICAL_FEATURES}
+            return {"has_data": False}
         
         consolidated = {f: 0.0 for f in self.MUSICAL_FEATURES}
         
@@ -373,7 +411,7 @@ class MusicMemory:
             for feat, val in pattern.get('features', {}).items():
                 if feat in consolidated:
                     consolidated[feat] += val * weight_ratio
-        
+        consolidated["has_data"] = True
         return consolidated
     
     def get_recent_style(self) -> dict:
@@ -382,10 +420,13 @@ class MusicMemory:
         
         Używane jako "świeża" inspiracja.
         """
+        with self._lock:
+            return self._recent_style_unlocked()
+
+    def _recent_style_unlocked(self) -> dict:
         if not self.H_log:
-            return {f: 0.5 for f in self.MUSICAL_FEATURES}
+            return {"has_data": False}
         
-        # Średnia z ostatnich 5 doświadczeń
         recent = self.H_log[-5:]
         avg = {f: 0.0 for f in self.MUSICAL_FEATURES}
         
@@ -393,7 +434,7 @@ class MusicMemory:
             for feat, val in exp.get('features', {}).items():
                 if feat in avg:
                     avg[feat] += val / len(recent)
-        
+        avg["has_data"] = True
         return avg
     
     def get_blended_style(self, recent_weight: float = 0.3) -> dict:
@@ -406,16 +447,25 @@ class MusicMemory:
         Returns:
             dict z cechami muzycznymi do użycia w kompozycji
         """
-        recent = self.get_recent_style()
-        consolidated = self.get_consolidated_style()
-        
-        blended = {}
+        with self._lock:
+            recent = self._recent_style_unlocked()
+            consolidated = self._consolidated_style_unlocked()
+
+        recent_ok = bool(recent.get("has_data"))
+        consolidated_ok = bool(consolidated.get("has_data"))
+        if not recent_ok and not consolidated_ok:
+            return {"has_data": False}
+        if recent_ok and not consolidated_ok:
+            return dict(recent)
+        if consolidated_ok and not recent_ok:
+            return dict(consolidated)
+
+        blended = {"has_data": True}
         for feat in self.MUSICAL_FEATURES:
             blended[feat] = (
-                recent_weight * recent.get(feat, 0.5) + 
+                recent_weight * recent.get(feat, 0.5) +
                 (1 - recent_weight) * consolidated.get(feat, 0.5)
             )
-        
         return blended
     
     def force_sleep(self):
@@ -424,20 +474,25 @@ class MusicMemory:
     
     def get_status(self) -> dict:
         """Zwraca status pamięci."""
-        return {
-            'h_log_size': len(self.H_log),
-            'd_map_size': len(self.D_Map),
-            'total_weight': sum(p['weight'] for p in self.D_Map.values()),
-            'sleep_count': self.sleep_count,
-            'experiences_since_sleep': self.experiences_since_sleep,
-            'is_sleeping': self.is_sleeping,
-            'last_sleep': datetime.fromtimestamp(self.last_sleep_time).isoformat()
-        }
+        with self._lock:
+            return {
+                'h_log_size': len(self.H_log),
+                'd_map_size': len(self.D_Map),
+                'total_weight': sum(p['weight'] for p in self.D_Map.values()),
+                'sleep_count': self.sleep_count,
+                'experiences_since_sleep': self.experiences_since_sleep,
+                'is_sleeping': self.is_sleeping,
+                'last_sleep': datetime.fromtimestamp(self.last_sleep_time).isoformat(),
+            }
     
     def shutdown(self):
-        """Zatrzymuje cykl snu i zapisuje pamięć."""
-        self.running = False
-        self._save_memory()
+        """Zatrzymuje cykl snu, scala zaległe doświadczenia i zapisuje pamięć."""
+        with self._lock:
+            self.running = False
+            if self.experiences_since_sleep > 0 and self.H_log:
+                self._consolidate_locked()
+            else:
+                self._save_memory()
         print(f"\033[93m[MEMORY] Pamięć zapisana. Dobranoc.\033[0m")
 
 
@@ -452,36 +507,45 @@ def get_music_memory() -> MusicMemory:
     return _music_memory
 
 
+def shutdown_music_memory():
+    """Zapisuje pamięć, jeśli kompozycja albo nauka zdążyły ją utworzyć."""
+    if _music_memory is not None:
+        _music_memory.shutdown()
+
+
 def analyze_midi_for_learning(midi_path: str) -> dict:
-    """
-    Analizuje plik MIDI i ekstrahuje cechy muzyczne do nauki.
-    
-    Używa music21 (już w projekcie) jako głównej biblioteki.
-    
-    Args:
-        midi_path: Ścieżka do pliku MIDI
-        
-    Returns:
-        dict z cechami muzycznymi (gotowy do record_experience)
-    """
+    """Wczytuje MIDI raz i liczy cechy pamięci nut."""
+    try:
+        from music21 import converter
+        score = converter.parse(midi_path)
+    except ImportError:
+        print("\033[91m[ANALYZE] Brak music21! Zainstaluj: pip install music21\033[0m")
+        return {}
+    except Exception as e:
+        print(f"\033[91m[ANALYZE] Błąd wczytywania MIDI: {e}\033[0m")
+        return {}
+    return _learning_features_from_score(score)
+
+
+def _learning_features_from_score(score) -> dict:
+    """Cechy pamięci nut z partytury, która jest już wczytana."""
+    if score is None:
+        return {}
     notes = []
     timings = []
-    
+
     try:
-        from music21 import converter, note as m21_note, chord as m21_chord
-        
-        score = converter.parse(midi_path)
-        
-        # === NOWE: Wykryj tonację ===
+        from music21 import note as m21_note, chord as m21_chord
+
         try:
             detected_key = score.analyze('key')
             key_tonic = detected_key.tonic.midi % 12  # 0-11
             key_mode = 1.0 if detected_key.mode == 'major' else 0.0
-        except:
+        except Exception:
             key_tonic = 0  # C
             key_mode = 1.0  # major
-        
-        for element in score.flat.notes:
+
+        for element in score.flatten().notes:
             if isinstance(element, m21_note.Note):
                 notes.append(element.pitch.midi)
                 timings.append(float(element.offset))
@@ -583,32 +647,27 @@ def analyze_midi_for_learning(midi_path: str) -> dict:
     return features
 
 
-def learn_from_midi(midi_path: str) -> bool:
-    """
-    Uczy system z pliku MIDI.
-    
-    Args:
-        midi_path: Ścieżka do pliku MIDI
-        
-    Returns:
-        True jeśli sukces
-    """
-    features = analyze_midi_for_learning(midi_path)
-    
+def learn_from_score(score, source: str) -> dict:
+    """Zapisuje cechy gotowej partytury do pamięci nut i zwraca je."""
+    features = _learning_features_from_score(score)
     if not features:
+        return {}
+    get_music_memory().record_experience(features, source)
+    return features
+
+
+def learn_from_midi(midi_path: str) -> bool:
+    """Uczy system z pliku MIDI. Jedno wczytanie."""
+    try:
+        from music21 import converter
+        score = converter.parse(midi_path)
+    except ImportError:
+        print("\033[91m[ANALYZE] Brak music21! Zainstaluj: pip install music21\033[0m")
         return False
-    
-    memory = get_music_memory()
-    source = os.path.basename(midi_path)
-    memory.record_experience(features, source)
-    
-    print(f"\033[92m[LEARN] Nauczyłem się z: {source}\033[0m")
-    print(f"  Powtórzenia: {features.get('repetition_density', 0):.2f}")
-    print(f"  Skoki: {features.get('leap_ratio', 0):.2f}")
-    print(f"  Regularność: {features.get('rhythmic_regularity', 0):.2f}")
-    print(f"  Synkopy: {features.get('syncopation_feel', 0):.2f}")
-    
-    return True
+    except Exception as e:
+        print(f"\033[91m[ANALYZE] Błąd wczytywania MIDI: {e}\033[0m")
+        return False
+    return bool(learn_from_score(score, os.path.basename(midi_path)))
 
 # =============================================================================
 # SZKIELET ETYCZNY (STAŁY, NIEZMIENNY)
@@ -716,11 +775,12 @@ class SoulStateLogger:
     def __init__(self):
         os.makedirs("data", exist_ok=True)
         self.event_counter = 0
+        self._known_last_id = 0
         self._initialize_and_migrate_file()
-        self._sync_counter()
+        self.event_counter = self._known_last_id
 
     def _initialize_and_migrate_file(self):
-        """Inicjalizuje plik lub wykonuje migrację struktury."""
+        """Inicjalizuje plik lub wykonuje migrację struktury. Ostatni numer zdarzenia zostaje w pamięci."""
         if not os.path.exists(self.FILE_PATH) or os.path.getsize(self.FILE_PATH) == 0:
             with open(self.FILE_PATH, 'w', newline='', encoding='utf-8') as f:
                 csv.writer(f).writerow(self.HEADER)
@@ -753,6 +813,8 @@ class SoulStateLogger:
                 df = df.reindex(columns=self.HEADER)
                 df.to_csv(self.FILE_PATH, index=False)
                 print("[SYSTEM] Migracja zakończona sukcesem.")
+            if not df.empty and "id_event" in df.columns:
+                self._known_last_id = int(df.iloc[-1]["id_event"])
                 
         except (pd.errors.EmptyDataError, pd.errors.ParserError):
             print("[ERROR] Plik historii uszkodzony. Tworzenie nowego.")
@@ -760,14 +822,6 @@ class SoulStateLogger:
                 csv.writer(f).writerow(self.HEADER)
         except Exception as e:
             print(f"[ERROR] Błąd weryfikacji historii: {e}")
-
-    def _sync_counter(self):
-        try:
-            df = pd.read_csv(self.FILE_PATH)
-            if not df.empty:
-                self.event_counter = int(df.iloc[-1]['id_event'])
-        except Exception:
-            self.event_counter = 0
 
     def log_state(self, core, F_vector, cos_alpha, emotion_msg, description, mode, compressed=False):
         """Zapisuje stan duszy do historii."""
@@ -803,7 +857,7 @@ class EriAmoCore:
     }
     
     def __init__(self):
-        self.lock = threading.Lock()
+        self.lock = threading.RLock()
         self.vector = SoulVector(np.zeros(len(self.AXES), dtype=float))
         self.last_decay_time = time.time()
         self.decay_cycle_count = 0
@@ -900,7 +954,8 @@ class EriAmoCore:
     
     def get_improv_level(self) -> float:
         """Zwraca aktualny poziom improwizacji (-100 do +100)."""
-        return self.vector.values[self.AXES.index('improwizacja')]
+        with self.lock:
+            return float(self.vector.values[self.AXES.index('improwizacja')])
     
     def get_ethics_status(self) -> dict:
         """Zwraca status szkieletu etycznego (zawsze stały)."""
@@ -931,9 +986,10 @@ class EriAmoCore:
             self.apply_emotion_decay(cycles)
 
     def get_emotional_state_description(self) -> str:
-        emocje = self.vector.values[self.AXES.index('emocje')]
-        affections = self.vector.values[self.AXES.index('affections')]
-        improv = self.vector.values[self.AXES.index('improwizacja')]
+        with self.lock:
+            emocje = float(self.vector.values[self.AXES.index('emocje')])
+            affections = float(self.vector.values[self.AXES.index('affections')])
+            improv = float(self.vector.values[self.AXES.index('improwizacja')])
         
         if abs(emocje) < 1.0: emotion_desc = "neutralne"
         elif emocje > 0: emotion_desc = "pobudzone (+)"
@@ -960,15 +1016,16 @@ class EriAmoCore:
             return hashlib.sha256(full_data.encode('utf-8')).hexdigest()
 
     def get_decay_status(self) -> dict:
-        return {
-            'cycles_applied': self.decay_cycle_count,
-            'last_decay': datetime.fromtimestamp(self.last_decay_time).isoformat(),
-            'ephemeral_axes': EPHEMERAL_AXES,
-            'persistent_axes': PERSISTENT_AXES,
-            'current_emotions': self.vector.values[self.AXES.index('emocje')],
-            'current_affections': self.vector.values[self.AXES.index('affections')],
-            'current_improv': self.vector.values[self.AXES.index('improwizacja')]
-        }
+        with self.lock:
+            return {
+                'cycles_applied': self.decay_cycle_count,
+                'last_decay': datetime.fromtimestamp(self.last_decay_time).isoformat(),
+                'ephemeral_axes': EPHEMERAL_AXES,
+                'persistent_axes': PERSISTENT_AXES,
+                'current_emotions': float(self.vector.values[self.AXES.index('emocje')]),
+                'current_affections': float(self.vector.values[self.AXES.index('affections')]),
+                'current_improv': float(self.vector.values[self.AXES.index('improwizacja')])
+            }
 
     def create_memory_dump(self, filename: str = None) -> str:
         os.makedirs("data/dumps", exist_ok=True)

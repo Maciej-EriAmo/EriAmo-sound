@@ -42,7 +42,7 @@ class SoulVisualizerV59:
             'kreacja': '#e67e22',     # Ciemny pomarańcz
             'byt': '#34495e',         # Szary
             'przestrzen': '#16a085',  # Morski
-            'etyka': '#27ae60'        # Zielony
+            'improwizacja': '#27ae60'  # Zielony
         }
 
     def _load_data(self) -> pd.DataFrame:
@@ -287,7 +287,7 @@ class SoulVisualizerV59:
                         y=df[f'S_{axis}'],
                         mode='lines+markers',
                         name=axis,
-                        line=dict(color=self.colors[axis], width=2, dash=dash),
+                        line=dict(color=self.colors.get(axis, "#95a5a6"), width=2, dash=dash),
                         marker=dict(size=4)
                     ),
                     row=row, col=col
@@ -314,7 +314,7 @@ class SoulVisualizerV59:
                 ax = axes_plt[idx // 3, idx % 3]
                 style = '--' if axis in EPHEMERAL_AXES else '-'
                 ax.plot(df['id_event'], df[f'S_{axis}'], 
-                       color=self.colors[axis], linewidth=2, 
+                       color=self.colors.get(axis, "#95a5a6"), linewidth=2, 
                        linestyle=style, marker='o', markersize=3)
                 ax.set_title(f"{axis.upper()} {'(efem.)' if axis in EPHEMERAL_AXES else ''}")
                 ax.axhline(y=0, color='k', linestyle='--', alpha=0.3)

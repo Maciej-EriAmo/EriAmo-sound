@@ -10,18 +10,12 @@ EriAmo v5.9 - Główny Interfejs CLI (UPDATE)
 - Wsparcie dla wyboru instrumentów przy kompozycji
 - Wygaszanie emocji z zachowaniem affections
 """
-import sys
 import shlex
-import os
-import numpy as np
 
-from amocore_v59 import EriAmoCore, SoulStateLogger, AXES_LIST, EPHEMERAL_AXES, PERSISTENT_AXES
-from music_analyzer_v59 import MusicAnalyzer
-from soul_composer_v59 import SoulComposerV59
-from visualizer_v59 import SoulVisualizerV59
-from data_loader_v59 import ExternalKnowledgeLoader
-from authorship_reporter_v59 import AuthorshipReporter
+from amocore_v59 import AXES_LIST, EPHEMERAL_AXES
 from genre_definitions import GENRE_DEFINITIONS, list_genres
+from instruments import list_instrument_names
+from session import EriAmoSession
 
 def print_banner():
     print("\033[96m")
@@ -58,6 +52,8 @@ def print_help():
     print("  !compose GATUNEK [INSTRUMENT] - Komponuj z wyborem barwy")
     print("     np. !compose BLUES SAX")
     print("     np. !compose MENUET DIST_GUITAR")
+    names = ", ".join(list_instrument_names())
+    print(f"     Instrumenty: {names}")
     print("  !genres                      - Lista gatunków")
     
     print("\n🎓 NAUKA I ANALIZA:")
@@ -74,16 +70,18 @@ def print_help():
 
 def main():
     print_banner()
-    core = EriAmoCore()
-    logger = SoulStateLogger()
-    analyzer = MusicAnalyzer(core, logger)
-    composer = SoulComposerV59(core, logger)
-    vis = SoulVisualizerV59()
-    loader = ExternalKnowledgeLoader()
-    reporter = AuthorshipReporter()
-     
+    session = EriAmoSession()
+    core = session.core
+
     print("\n💡 Wpisz 'help' aby zobaczyć komendy\n")
-    
+
+    try:
+        _command_loop(session, core)
+    finally:
+        session.shutdown()
+
+
+def _command_loop(session, core):
     while True:
         try:
             raw = input("\033[90mEriAmo> \033[0m").strip()
@@ -108,15 +106,14 @@ def main():
                 if len(parts) < 2:
                     print("❌ Użycie: !compose GATUNEK [INSTRUMENT]")
                     print(f"   Dostępne: {', '.join(list_genres()[:5])}...")
-                    print(f"   Instrumenty: PIANO, ORGAN, GUITAR, DIST_GUITAR, SAX, CHOIR, SYNTH...")
+                    print(f"   Instrumenty: {', '.join(list_instrument_names())}")
                     continue
                 
                 genre = parts[1].upper()
-                # Pobierz instrument jeśli podany
-                instr = parts[2].upper() if len(parts) > 2 else None
+                instr = parts[2] if len(parts) > 2 else None
                 
                 try:
-                    paths = composer.compose_new_work(genre, instrument_override=instr)
+                    paths = session.compose(genre, instrument=instr)
                     print("\n" + "="*60)
                     print(f"✅ SKOMPONOWANO: {genre}" + (f" ({instr})" if instr else ""))
                     print("="*60)
@@ -129,17 +126,15 @@ def main():
             # ========== RESZTA KOMEND (BEZ ZMIAN) ==========
             elif cmd in ["!teach", "!simulate"]:
                 if len(parts) < 3: print("❌ Użycie: !teach \"Tytuł\" CECHY..."); continue
-                analyzer.analyze_and_shift(parts[2:], parts[1], mode=cmd)
+                session.teach(parts[2:], parts[1], mode=cmd)
             
             elif cmd == "!web":
                 if len(parts) < 3: print("❌ Użycie: !web \"Artysta\" \"Utwór\""); continue
-                features = loader.get_context_from_web(parts[1], parts[2])
-                if features: analyzer.analyze_and_shift(features, f"{parts[1]} - {parts[2]}", mode="!teach")
+                session.learn_web(parts[1], parts[2])
             
             elif cmd == "!file":
                 if len(parts) < 2: print("❌ Użycie: !file ścieżka"); continue
-                features = loader.parse_music_file(parts[1])
-                if features: analyzer.analyze_and_shift(features, f"Plik: {os.path.basename(parts[1])}", mode="!teach")
+                session.learn_file(parts[1])
             
             elif cmd == "!genres":
                 print("\n📚 DOSTĘPNE GATUNKI:")
@@ -151,18 +146,25 @@ def main():
                     print(f"  {name:<16} {mood}  {info['opis'][:40]}")
                 print("-"*60 + "\n")
             
-            elif cmd == "!report": vis.create_complete_report()
-            elif cmd == "!trajectory": vis.create_3d_trajectory()
-            elif cmd == "!timeline": vis.create_timeline_evolution()
-            elif cmd == "!emotions": vis.create_emotional_map()
+            elif cmd == "!report": session.visualizer.create_complete_report()
+            elif cmd == "!trajectory": session.visualizer.create_3d_trajectory()
+            elif cmd == "!timeline": session.visualizer.create_timeline_evolution()
+            elif cmd == "!emotions": session.visualizer.create_emotional_map()
             
             elif cmd == "!decay":
-                cycles = int(parts[1]) if len(parts) > 1 else 1
+                try:
+                    cycles = int(parts[1]) if len(parts) > 1 else 1
+                except ValueError:
+                    print("❌ Podaj liczbę całkowitą cykli.")
+                    continue
                 print(f"\n⏱️ Ręczne wygaszanie: {cycles} cykli...")
-                vec_before = core.get_vector_copy()
-                core.apply_emotion_decay(cycles)
-                vec_after = core.get_vector_copy()
+                try:
+                    vec_before, vec_after = session.decay(cycles)
+                except ValueError as decay_error:
+                    print(f"❌ {decay_error}")
+                    continue
                 print(f"  🔻 Emocje: {vec_before[AXES_LIST.index('emocje')]:+.2f} → {vec_after[AXES_LIST.index('emocje')]:+.2f}")
+                print("  Zapisano w historii duszy.")
                 print("")
             
             elif cmd == "!decay_status":
@@ -175,9 +177,14 @@ def main():
             
             elif cmd == "!compare":
                 if len(parts) < 3: print("❌ Użycie: !compare ID_A ID_B"); continue
-                reporter.create_report(int(parts[1]), int(parts[2]))
+                try:
+                    id_a, id_b = int(parts[1]), int(parts[2])
+                except ValueError:
+                    print("❌ ID muszą być liczbami całkowitymi.")
+                    continue
+                session.reporter.create_report(id_a, id_b)
             
-            elif cmd == "!events": reporter.list_events()
+            elif cmd == "!events": session.reporter.list_events()
             
             elif cmd == "!status":
                 vec = core.get_vector_copy()
