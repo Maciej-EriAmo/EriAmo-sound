@@ -16,6 +16,7 @@ import threading
 import queue
 import os
 import sys
+from pathlib import Path
 
 # WAŻNE: Ustawienie backendu matplotlib PRZED importem
 import matplotlib
@@ -374,6 +375,15 @@ class EriAmoApp(ctk.CTk):
             width=200
         )
         btn_compose.pack(pady=25)
+
+        btn_play = ctk.CTkButton(
+            frame,
+            text="Odtwórz MIDI",
+            fg_color="#1abc9c",
+            command=self._play_last_midi,
+            width=200
+        )
+        btn_play.pack(pady=5)
         
         btn_report = ctk.CTkButton(
             frame, 
@@ -423,8 +433,13 @@ class EriAmoApp(ctk.CTk):
         
         elif status == "SUCCESS":
             self._log(f"[OK] {msg['msg']}")
-            if msg.get('data', {}).get('txt'):
-                self._log(f"   Plik: {msg['data']['txt']}")
+            data = msg.get('data') or {}
+            if data.get('midi'):
+                self.last_midi = data['midi']
+                self._log(f"   MIDI: {data['midi']}")
+            if data.get('txt'):
+                self._log(f"   Plik: {data['txt']}")
+            self._play_windows_midi(data)
         
         elif status == "REPORT_READY":
             self._log("[RAPORT] Gotowy")
@@ -434,7 +449,7 @@ class EriAmoApp(ctk.CTk):
                 # Otwórz w przeglądarce
                 try:
                     import webbrowser
-                    webbrowser.open('file://' + os.path.abspath(paths['basic']))
+                    webbrowser.open(Path(paths['basic']).resolve().as_uri())
                 except Exception:
                     pass
         
@@ -480,6 +495,45 @@ class EriAmoApp(ctk.CTk):
             'mode': mode
         })
         self._log(f"Wyslano: {title}...")
+
+    def _play_windows_midi(self, paths):
+        """Gra WAV kompozycji, a gdy go nie ma — MIDI."""
+        if not paths:
+            return
+        wav = paths.get("wav")
+        if wav and os.path.isfile(wav):
+            try:
+                from midi_windows import play_wav
+                played = play_wav(wav)
+                self._log(f"[AUDIO] Odtwarzam WAV: {played}")
+            except Exception as exc:
+                self._log(f"[AUDIO] {exc}")
+                if paths.get("midi"):
+                    self._play_midi_path(paths["midi"])
+            return
+        if paths.get("midi"):
+            self._play_midi_path(paths["midi"])
+
+    def _play_last_midi(self):
+        path = getattr(self, "last_midi", None)
+        if not path:
+            try:
+                from amocore_v59 import under_home
+                from midi_windows import newest_midi
+                path = newest_midi(under_home("compositions"))
+            except Exception as exc:
+                self._log(f"[MIDI] {exc}")
+                return
+        self._play_midi_path(path)
+
+    def _play_midi_path(self, path):
+        try:
+            from midi_windows import play_midi, playback_label
+            played = play_midi(path)
+            self.last_midi = played
+            self._log(f"[MIDI] Odtwarzam przez {playback_label()}: {played}")
+        except Exception as exc:
+            self._log(f"[MIDI] {exc}")
 
     def _send_compose(self):
         """Wysyła komendę kompozycji."""

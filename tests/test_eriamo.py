@@ -4,16 +4,22 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 """Testy bez renderu audio: osie, instrumenty, zanik, gatunki, kosinus."""
+import csv
+import json
 import os
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 import numpy as np
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+
+# Kompozycje w testach nie renderują WAV. Bank ma 148 MB.
+os.environ.setdefault("ERIAMO_SKIP_WAV", "1")
 
 import amocore_v59
 from amocore_v59 import AXES_LIST, EriAmoCore
@@ -66,7 +72,9 @@ class CatalogTests(unittest.TestCase):
 class DiskTests(unittest.TestCase):
     def setUp(self):
         self._old = os.getcwd()
+        self._old_home = os.environ.get("ERIAMO_HOME")
         self._tmp = tempfile.TemporaryDirectory()
+        os.environ["ERIAMO_HOME"] = self._tmp.name
         os.chdir(self._tmp.name)
         amocore_v59.shutdown_music_memory()
         amocore_v59._music_memory = None
@@ -79,6 +87,10 @@ class DiskTests(unittest.TestCase):
         amocore_v59._music_memory = None
         amocore_v59._curiosity_engine = None
         os.chdir(self._old)
+        if self._old_home is None:
+            os.environ.pop("ERIAMO_HOME", None)
+        else:
+            os.environ["ERIAMO_HOME"] = self._old_home
         self._tmp.cleanup()
 
     def test_decay_is_reloaded_from_history(self):
@@ -302,7 +314,7 @@ class DiskTests(unittest.TestCase):
             "has_data": True,
             "key_tonic": 7 / 11.0,
             "key_mode": 1.0,
-            "note_density": 0.5,
+            "note_density": 1.0,
             "syncopation_feel": 0.0,
         }
         homes = {
@@ -345,7 +357,7 @@ class DiskTests(unittest.TestCase):
                 "has_data": True,
                 "key_tonic": 0.0,
                 "key_mode": 0.0,
-                "note_density": 0.5,
+                "note_density": 1.0,
                 "syncopation_feel": 0.0,
             }
             composer._get_soul_metrics = lambda: using(minor)
@@ -358,7 +370,7 @@ class DiskTests(unittest.TestCase):
                 "has_data": True,
                 "key_tonic": 0.0,
                 "key_mode": 1.0,
-                "note_density": 0.5,
+                "note_density": 1.0,
                 "syncopation_feel": 0.9,
             }
             composer._get_soul_metrics = lambda: using(syncopated)
@@ -375,6 +387,384 @@ class DiskTests(unittest.TestCase):
         path = core.create_memory_dump("test.soul")
         self.assertTrue(os.path.isfile(path))
         self.assertTrue(core.load_memory_dump(path))
+
+    def test_broken_history_keeps_a_backup_and_the_earlier_rows(self):
+        session = EriAmoSession()
+        session.decay(1)
+        path = Path("data/soul_history.csv")
+        with path.open("a", encoding="utf-8") as handle:
+            handle.write('2020-01-01,"unterminated\n')
+        amocore_v59.SoulStateLogger()
+        restored = path.read_text(encoding="utf-8")
+        self.assertIn("!decay", restored)
+        self.assertNotIn("unterminated", restored)
+        backups = list(Path("data").glob("soul_history.csv.broken*"))
+        self.assertEqual(len(backups), 1)
+        self.assertIn("unterminated", backups[0].read_text(encoding="utf-8"))
+        reborn = EriAmoCore()
+        self.assertTrue(all(np.isfinite(reborn.get_vector_copy())))
+
+    def test_blank_axis_does_not_become_the_soul(self):
+        session = EriAmoSession()
+        session.core.shift_axis("emocje", "SET", 6.0)
+        session.decay(1)
+        good = EriAmoCore().get_vector_copy().copy()
+        path = Path("data/soul_history.csv")
+        with path.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.reader(handle))
+        emocje = rows[0].index("S_emocje")
+        broken = list(rows[-1])
+        broken[emocje] = ""
+        with path.open("a", encoding="utf-8", newline="") as handle:
+            csv.writer(handle).writerow(broken)
+        reborn = EriAmoCore()
+        np.testing.assert_allclose(reborn.get_vector_copy(), good)
+
+    def test_incomplete_dump_does_not_replace_the_soul(self):
+        core = EriAmoCore()
+        core.shift_axis("emocje", "SET", 0.0)
+        before = core.get_vector_copy().copy()
+        path = os.path.join(self._tmp.name, "bad.soul")
+        Path(path).write_text(json.dumps({"soul_vector": {"emocje": 12.5}, "meta": {}}), encoding="utf-8")
+        self.assertFalse(core.load_memory_dump(path))
+        np.testing.assert_allclose(core.get_vector_copy(), before)
+
+    def test_sleep_does_not_reinforce_the_same_experience_twice(self):
+        memory = amocore_v59.get_music_memory()
+        memory.H_log = [{
+            "features": {
+                "repetition_density": 0.1,
+                "leap_ratio": 0.1,
+                "rhythmic_regularity": 0.8,
+                "syncopation_feel": 0.0,
+                "key_tonic": 0.0,
+                "key_mode": 1.0,
+            },
+            "source": "t",
+        }]
+        memory.D_Map = {}
+        memory._consolidated_index = 0
+        memory.is_sleeping = False
+        memory._consolidate_locked()
+        weight = next(iter(memory.D_Map.values()))["weight"]
+        memory._consolidate_locked()
+        self.assertEqual(next(iter(memory.D_Map.values()))["weight"], weight)
+        self.assertFalse(memory.is_sleeping)
+
+    def test_dedup_keeps_weight_from_the_third_pattern(self):
+        memory = amocore_v59.get_music_memory()
+        memory.D_Map = {
+            "rep:L|lea:L|rhy:L|syn:L|ton:0M": {"weight": 1.0, "features": {}},
+            "rep:L|lea:M|rhy:L|syn:L|ton:0M": {"weight": 5.0, "features": {}},
+            "rep:L|lea:H|rhy:L|syn:L|ton:0M": {"weight": 1.0, "features": {}},
+        }
+        memory._deduplicate_patterns()
+        self.assertEqual(len(memory.D_Map), 1)
+        self.assertAlmostEqual(next(iter(memory.D_Map.values()))["weight"], 6.0)
+
+    def test_missing_reinforced_count_does_not_stick_the_sleep_flag(self):
+        memory = amocore_v59.get_music_memory()
+        experience = {
+            "features": {
+                "repetition_density": 1.0,
+                "leap_ratio": 0.0,
+                "rhythmic_regularity": 1.0,
+                "syncopation_feel": 0.0,
+                "key_tonic": 0.0,
+                "key_mode": 1.0,
+            },
+            "source": "t",
+        }
+        key = memory._extract_pattern_key(experience)
+        memory.D_Map = {key: {"weight": 1.0, "features": experience["features"]}}
+        memory.H_log = [experience]
+        memory._consolidated_index = 0
+        memory.is_sleeping = False
+        memory._consolidate_locked()
+        self.assertFalse(memory.is_sleeping)
+        self.assertEqual(memory.D_Map[key]["reinforced_count"], 1)
+
+    def test_fuga_does_not_move_the_soul(self):
+        session = EriAmoSession()
+        original = session.core.get_vector_copy().copy()
+        with self.assertRaises(ValueError):
+            session.compose("FUGA")
+        np.testing.assert_allclose(session.core.get_vector_copy(), original)
+        history = Path("data/soul_history.csv").read_text(encoding="utf-8")
+        self.assertNotIn("FUGA", history)
+
+    def test_report_escapes_text_from_the_history(self):
+        session = EriAmoSession()
+        session.logger.log_state(
+            session.core,
+            session.core.get_vector_copy(),
+            0.2,
+            "raw &",
+            "<b>xss</b>",
+            "!teach",
+        )
+        path = session.visualizer.create_basic_report()
+        page = Path(path).read_text(encoding="utf-8")
+        self.assertIn("&lt;b&gt;xss&lt;/b&gt;", page)
+        self.assertNotIn("<b>xss</b>", page)
+        self.assertIn("raw &amp;", page)
+
+    def test_data_stays_in_eriamo_home_when_cwd_changes(self):
+        session = EriAmoSession()
+        session.decay(1)
+        elsewhere = tempfile.TemporaryDirectory()
+        os.chdir(elsewhere.name)
+        try:
+            reborn = EriAmoCore()
+            self.assertTrue(np.any(reborn.get_vector_copy() != 0) or Path(self._tmp.name, "data", "soul_history.csv").is_file())
+            self.assertTrue(Path(self._tmp.name, "data", "soul_history.csv").is_file())
+            self.assertFalse(Path(elsewhere.name, "data", "soul_history.csv").exists())
+        finally:
+            os.chdir(self._tmp.name)
+            elsewhere.cleanup()
+
+
+class LearningTests(unittest.TestCase):
+    def test_style_words_match_whole_words(self):
+        from data_loader_v59 import ExternalKnowledgeLoader
+        loader = ExternalKnowledgeLoader()
+        self.assertNotIn("AMBIENT", loader._analyze_text_heuristics("Venom Black Metal"))
+        self.assertNotIn("AMBIENT", loader._analyze_text_heuristics("tenor sax"))
+        self.assertIn("AMBIENT", loader._analyze_text_heuristics("Brian Eno"))
+        self.assertNotIn("PROG_ROCK", loader._analyze_text_heuristics("Yesterday"))
+        self.assertIn("PROG_ROCK", loader._analyze_text_heuristics("Yes"))
+        self.assertNotIn("RADOSC", loader._analyze_text_heuristics("Duran Duran"))
+        self.assertIn("RADOSC", loader._analyze_text_heuristics("Sonata in C dur"))
+        self.assertNotIn("HEAVY_METAL", loader._analyze_text_heuristics("acceptable"))
+        self.assertIn("HEAVY_METAL", loader._analyze_text_heuristics("Accept"))
+
+    def test_new_soul_has_no_discovery_penalty(self):
+        engine = amocore_v59.CuriosityEngine()
+        self.assertIsNone(engine.discovery_cooldown)
+        self.assertEqual(engine._compute_discovery_penalty(), 0.0)
+        engine.register_discovery()
+        self.assertEqual(engine.discovery_cooldown, 0)
+        self.assertEqual(engine._compute_discovery_penalty(), 20.0)
+
+    def test_chords_are_not_melodic_leaps_and_quarters_are_not_presto(self):
+        from music21 import chord, note, stream
+
+        score = stream.Stream()
+        for index, pitch in enumerate([60, 62, 64, 65, 67, 65, 64, 62]):
+            score.insert(float(index), note.Note(pitch, quarterLength=1))
+            score.insert(float(index), chord.Chord([48, 52, 55], quarterLength=1))
+        features = amocore_v59._learning_features_from_score(score)
+        self.assertLess(features["leap_ratio"], 0.25)
+        self.assertAlmostEqual(features["note_density"], 1.0, places=2)
+
+        eighths = stream.Stream()
+        for _ in range(8):
+            eighths.append(note.Note(60, quarterLength=0.5))
+        dense = amocore_v59._learning_features_from_score(eighths)
+        self.assertAlmostEqual(dense["note_density"], 2.0, places=2)
+
+    @unittest.skipUnless(sys.platform == "win32", "syntezator Windows")
+    def test_windows_sequencer_reads_music21_midi_and_play_is_detached(self):
+        from music21 import note, stream
+
+        import midi_windows
+
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        score = stream.Score()
+        part = stream.Part()
+        part.append(note.Note(60, quarterLength=1))
+        score.append(part)
+        path = os.path.join(folder.name, "one.mid")
+        score.write("midi", fp=path)
+
+        self.assertGreater(midi_windows.probe_midi(path), 0)
+        midi_windows.stop_midi()
+        with mock.patch.object(midi_windows.subprocess, "Popen", return_value=mock.Mock(poll=lambda: None)) as popen:
+            played = midi_windows.play_midi(path)
+        self.assertEqual(played, os.path.abspath(path))
+        command = popen.call_args.args[0]
+        self.assertEqual(command, midi_windows.play_command(os.path.abspath(path)))
+        self.assertEqual(os.path.abspath(command[-1]), os.path.abspath(path))
+        self.assertNotEqual(popen.call_args.kwargs.get("creationflags", 0), 0)
+        self.assertIsNone(midi_windows.play_composed_midi({"midi": path, "wav": path + ".wav"}))
+
+    @unittest.skipUnless(sys.platform == "win32", "syntezator Windows")
+    def test_play_uses_eriamo_midi_when_player_and_soundfont_exist(self):
+        from music21 import note, stream
+
+        import midi_windows
+
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        score = stream.Score()
+        part = stream.Part()
+        part.append(note.Note(60, quarterLength=1))
+        score.append(part)
+        path = os.path.join(folder.name, "one.mid")
+        score.write("midi", fp=path)
+        player = os.path.join(folder.name, "eriamo-midi.exe")
+        soundfont = os.path.join(folder.name, "bank.sf2")
+
+        with mock.patch.object(midi_windows, "rust_player_path", return_value=player), \
+             mock.patch.object(midi_windows, "resolved_soundfont", return_value=soundfont), \
+             mock.patch.object(midi_windows.subprocess, "Popen", return_value=mock.Mock(poll=lambda: None)) as popen:
+            played = midi_windows.play_midi(path)
+
+        self.assertEqual(played, os.path.abspath(path))
+        command = popen.call_args.args[0]
+        self.assertEqual(command, [player, "play", "--soundfont", soundfont, os.path.abspath(path)])
+
+    @unittest.skipUnless(sys.platform == "win32", "syntezator Windows")
+    def test_play_uses_eriamo_midi_without_soundfont(self):
+        from music21 import note, stream
+
+        import midi_windows
+
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        score = stream.Score()
+        part = stream.Part()
+        part.append(note.Note(60, quarterLength=1))
+        score.append(part)
+        path = os.path.join(folder.name, "one.mid")
+        score.write("midi", fp=path)
+        player = os.path.join(folder.name, "eriamo-midi.exe")
+
+        with mock.patch.object(midi_windows, "rust_player_path", return_value=player), \
+             mock.patch.object(midi_windows, "resolved_soundfont", return_value=None), \
+             mock.patch.object(midi_windows.subprocess, "Popen", return_value=mock.Mock(poll=lambda: None)) as popen:
+            midi_windows.play_midi(path)
+
+        command = popen.call_args.args[0]
+        self.assertEqual(command, [player, "play", os.path.abspath(path)])
+
+    def test_render_uses_eriamo_midi_instead_of_missing_fluidsynth(self):
+        import composer_score
+        import midi_windows
+
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        midi_path = os.path.join(folder.name, "one.mid")
+        wav_path = os.path.join(folder.name, "one.wav")
+        with open(midi_path, "wb") as handle:
+            handle.write(b"MThd")
+
+        def write_wav(command, **_kwargs):
+            self.assertEqual(command[1], "render")
+            self.assertEqual(command[-2], midi_path)
+            self.assertEqual(command[-1], wav_path)
+            with open(wav_path, "wb") as handle:
+                handle.write(b"RIFF")
+            return mock.Mock(returncode=0, stdout="", stderr="")
+
+        with mock.patch.dict(os.environ, {"ERIAMO_SKIP_WAV": ""}), \
+             mock.patch.object(composer_score, "resolve_soundfont", return_value="bank.sf2"), \
+             mock.patch.object(midi_windows, "rust_player_path", return_value="eriamo-midi.exe"), \
+             mock.patch.object(midi_windows, "resolved_soundfont", return_value="bank.sf2"), \
+             mock.patch.object(midi_windows.subprocess, "run", side_effect=write_wav), \
+             mock.patch.object(composer_score, "AudioSegment", None), \
+             mock.patch.object(composer_score.shutil, "which", return_value=None):
+            paths = composer_score.ScoreMixin._render_audio(object(), midi_path)
+
+        self.assertEqual(paths.get("wav"), wav_path)
+
+    def test_composed_wav_plays_without_starting_midi(self):
+        import midi_windows
+
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        wav_path = os.path.join(folder.name, "one.wav")
+        with open(wav_path, "wb") as handle:
+            handle.write(b"RIFF")
+        with mock.patch("winsound.PlaySound") as play:
+            message = midi_windows.play_composed_midi({"midi": wav_path + ".mid", "wav": wav_path})
+        play.assert_called_once()
+        self.assertIn(os.path.abspath(wav_path), message or "")
+
+    def test_rock_line_is_a_stepwise_sequence(self):
+        import random
+
+        random.seed(1)
+        data = EriAmoSession().composer._generate_rock_polyphonic()
+        melody = data["melody"]
+        self.assertGreaterEqual(len(melody), 8)
+
+        def pitches(bar):
+            return [ev["pitch"] for ev in bar if ev.get("type") == "note"]
+
+        stream = []
+        for bar in melody:
+            self.assertAlmostEqual(sum(float(ev["duration"]) for ev in bar), 4.0, places=3)
+            got = pitches(bar)
+            self.assertGreater(len(got), 0)
+            stream.extend(got)
+        intervals = [abs(b - a) for a, b in zip(stream, stream[1:])]
+        self.assertGreater(len(intervals), 0)
+        small = sum(1 for gap in intervals if gap <= 5)
+        self.assertGreater(small / len(intervals), 0.75)
+        first = pitches(melody[0])
+        second = pitches(melody[1])
+        answer = pitches(melody[4])
+        rock = [57, 60, 61, 62, 64, 67, 69]
+        tones = sorted(set(rock + [pitch + 12 for pitch in rock]))
+        self.assertEqual(
+            [tones.index(pitch) for pitch in second],
+            [tones.index(pitch) + 1 for pitch in first],
+        )
+        self.assertNotEqual(first, answer)
+
+    def test_lament_sequence_steps_down(self):
+        import random
+
+        random.seed(1)
+        melody = EriAmoSession().composer._generate_lament_polyphonic()["melody"]
+        opening = [ev["pitch"] for ev in melody[0] if ev.get("type") == "note"]
+        answer = [ev["pitch"] for ev in melody[1] if ev.get("type") == "note"]
+        self.assertGreater(len(opening), 0)
+        self.assertLess(answer[0], opening[0])
+        self.assertAlmostEqual(sum(float(ev["duration"]) for ev in melody[0]), 4.0, places=3)
+
+    def test_menuet_dice_line_does_not_jump_between_bars(self):
+        import random
+
+        random.seed(2)
+        data = EriAmoSession().composer._generate_menuet_mozart_dice()
+        melody = data["melody"]
+        self.assertEqual(len(melody), 16)
+        previous = None
+        for bar in melody:
+            self.assertAlmostEqual(sum(float(ev["duration"]) for ev in bar), 3.0, places=3)
+            pitches = [ev["pitch"] for ev in bar if ev.get("type") == "note"]
+            self.assertGreater(len(pitches), 0)
+            for left, right in zip(pitches, pitches[1:]):
+                self.assertLessEqual(abs(right - left), 5)
+            if previous is not None:
+                self.assertLessEqual(abs(pitches[0] - previous), 7)
+            previous = pitches[-1]
+
+    def test_rock_and_roll_tempo_is_allegro_moderato(self):
+        from composer_score import ScoreMixin
+
+        data = {
+            "melody": [[{"type": "note", "pitch": 60, "duration": 1.0, "dynamic": "f"}]],
+            "harmony": [[{"type": "chord", "pitch": [48, 55], "duration": 1.0, "dynamic": "mf"}]],
+        }
+        score = ScoreMixin._create_music21_score(ScoreMixin(), data, "ROCK_AND_ROLL")
+        marks = list(score.recurse().getElementsByClass("MetronomeMark"))
+        self.assertEqual(marks[0].number, 120)
+
+    def test_quoted_midi_path_is_rejected(self):
+        import midi_windows
+
+        with self.assertRaises(ValueError):
+            midi_windows.play_midi(r'C:\eriamo\bad"name.mid')
+
+    def test_report_uri_uses_three_slashes_on_windows_drive(self):
+        uri = Path("C:/Users/eriamo/report basic.html").resolve().as_uri()
+        self.assertTrue(uri.startswith("file:///"))
+        self.assertNotIn("\\", uri)
+        self.assertIn("report%20basic.html", uri)
 
 
 if __name__ == "__main__":

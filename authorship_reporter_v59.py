@@ -13,7 +13,7 @@ Raporter Atrybucji Autorstwa EriAmo v5.9
 import pandas as pd
 import numpy as np
 import os
-from amocore_v59 import AXES_LIST, EPHEMERAL_AXES, PERSISTENT_AXES
+from amocore_v59 import AXES_LIST, EPHEMERAL_AXES, PERSISTENT_AXES, under_home
 
 
 def cosine_similarity(v1, v2) -> float:
@@ -31,8 +31,13 @@ class AuthorshipReporter:
     Porównuje wektory F (styl utworu) między zdarzeniami,
     uwzględniając rozróżnienie osi efemerycznych i trwałych.
     """
-    DATA_PATH = "data/soul_history.csv"
-    REPORT_DIR = "reports_attribution"
+    @property
+    def DATA_PATH(self) -> str:
+        return under_home("data", "soul_history.csv")
+
+    @property
+    def REPORT_DIR(self) -> str:
+        return under_home("reports_attribution")
 
     def __init__(self):
         os.makedirs(self.REPORT_DIR, exist_ok=True)

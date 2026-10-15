@@ -414,6 +414,7 @@ class MenuetMixin:
         """
         metrics = self._get_soul_metrics()
         memory_style = metrics.get('memory_style', {})
+        self._menuet_cursor = None
         
         # Pobierz tablice kości
         dice_master = self.MENUET_MASTERS.get('MOZART_DICE', {})
@@ -610,9 +611,7 @@ class MenuetMixin:
         My generujemy je algorytmicznie, ale measure_id wpływa na wybór wzorca.
         """
         memory_style = metrics.get('memory_style', {})
-        improv = metrics.get('improv_params', {})
-        freedom = improv.get('freedom_level', 0.5)
-        
+
         # measure_id wpływa na charakter taktu
         pattern_type = measure_id % 8  # 8 typów wzorców
         
@@ -629,52 +628,54 @@ class MenuetMixin:
         ]
         
         rhythm = rhythms[pattern_type]
-        
-        # Wzorce melodyczne zależne od pozycji w formie
-        if section == 'A':
-            if measure_idx == 0:
-                # Początek - akord toniczny
-                start_idx = random.choice([0, 2, 4])  # I, III, V stopień
-            elif measure_idx == 3 or measure_idx == 7:
-                # Kadencja - kieruj do toniki lub dominanty
-                start_idx = random.choice([0, 4])
-            else:
-                start_idx = random.randint(0, len(scale) // 2)
-        else:  # B
-            if measure_idx == 0:
-                # Początek B - często od dominanty
-                start_idx = 4  # V stopień
-            elif measure_idx == 7:
-                # Zakończenie - tonika
-                start_idx = 0
-            else:
-                start_idx = random.randint(0, len(scale) // 2)
-        
-        # Generuj nuty
+        cells = (
+            (1, 1, -1),
+            (1, -1, 1),
+            (-1, 1, 1),
+            (1, 2, -1),
+            (1, 1, -1, 1),
+            (-1, 1, -1),
+            (1, -1, 2),
+            (1, 0, -1),
+        )
+        cell = cells[pattern_type]
+        # Kadencje idą po stopniach do dominanty albo toniki, bez skoku na początek taktu.
+        if section == 'A' and measure_idx == 3:
+            cadence_target = 4
+        elif section == 'A' and measure_idx == 7:
+            cadence_target = 0
+        elif section == 'B' and measure_idx == 0:
+            cadence_target = 4
+        elif section == 'B' and measure_idx == 7:
+            cadence_target = 0
+        else:
+            cadence_target = None
+
+        cursor = getattr(self, "_menuet_cursor", None)
+        if cursor is None:
+            current_idx = random.choice([0, 2, 4])
+        else:
+            current_idx = max(0, min(len(scale) - 1, int(cursor)))
+
         notes = []
-        current_idx = start_idx
-        
         for i, dur in enumerate(rhythm):
-            # Dynamika
             dyn = 'mf' if i == 0 else 'mp'
-            
-            # Pitch
-            pitch = scale[min(current_idx, len(scale) - 1)]
-            notes.append({'type': 'note', 'pitch': pitch, 'duration': dur, 'dynamic': dyn})
-            
-            # Ruch melodyczny (typowy dla Mozarta - głównie krokowy z okazjonalnymi skokami)
-            if random.random() < 0.7:  # 70% kroki
-                step = random.choice([-1, 1, 1, -1, 0])
-            else:  # 30% skoki
-                step = random.choice([-2, 2, -3, 3])
-            
-            # Pamięć może zwiększyć skoki
-            if memory_style.get('leap_ratio', 0.3) > 0.5:
-                if random.random() < 0.3:
-                    step = random.choice([-3, -2, 2, 3, 4])
-            
-            current_idx = max(0, min(len(scale) - 1, current_idx + step))
-        
+            if cadence_target is not None and current_idx != cadence_target:
+                current_idx += 1 if current_idx < cadence_target else -1
+            current_idx = max(0, min(len(scale) - 1, current_idx))
+            notes.append({
+                'type': 'note',
+                'pitch': scale[current_idx],
+                'duration': dur,
+                'dynamic': dyn,
+            })
+            if cadence_target is None:
+                step = cell[i % len(cell)]
+                if memory_style.get('leap_ratio', 0.3) > 0.5 and random.random() < 0.3:
+                    step += 1 if step >= 0 else -1
+                current_idx = max(0, min(len(scale) - 1, current_idx + step))
+
+        self._menuet_cursor = current_idx
         return notes
     
     def _select_menuet_style(self, metrics: dict, forced_style: str = None) -> dict:
@@ -746,10 +747,9 @@ class MenuetMixin:
             
             # Mieszaj charakterystyki (średnia ważona: 60% primary, 40% secondary)
             for key, val in secondary_style['characteristics'].items():
-                if key in config['characteristics']:
-                    config['characteristics'][key] = (
-                        0.6 * config['characteristics'][key] + 0.4 * val
-                    )
+                current = config['characteristics'].get(key)
+                if isinstance(current, (int, float)) and isinstance(val, (int, float)):
+                    config['characteristics'][key] = 0.6 * current + 0.4 * val
             
             # Dodaj wzorce z secondary
             for key, patterns in secondary_style['typical_patterns'].items():

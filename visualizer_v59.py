@@ -5,6 +5,7 @@
 # it under the terms of the GNU General Public License as published by
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
+import html as html_lib
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
@@ -12,7 +13,7 @@ import os
 import base64
 from io import BytesIO
 from datetime import datetime
-from amocore_v59 import AXES_LIST, EPHEMERAL_AXES, PERSISTENT_AXES
+from amocore_v59 import AXES_LIST, EPHEMERAL_AXES, PERSISTENT_AXES, under_home
 
 try:
     import plotly.graph_objects as go
@@ -25,9 +26,14 @@ except ImportError:
 
 class SoulVisualizerV59:
     """Wizualizator stanu i historii duszy."""
-    
-    DATA_PATH = "data/soul_history.csv"
-    REPORT_DIR = "reports"
+
+    @property
+    def DATA_PATH(self) -> str:
+        return under_home("data", "soul_history.csv")
+
+    @property
+    def REPORT_DIR(self) -> str:
+        return under_home("reports")
     
     def __init__(self):
         os.makedirs(self.REPORT_DIR, exist_ok=True)
@@ -61,15 +67,22 @@ class SoulVisualizerV59:
         
         last = df.iloc[-1]
         vec = [last[f"S_{a}"] for a in AXES_LIST]
-        
-        # Radar chart
+        safe_description = html_lib.escape(str(last['description']))
+        safe_timestamp = html_lib.escape(str(last['timestamp']))
+        safe_emotion = html_lib.escape(str(last['emotion_msg']))
+        safe_cosine = html_lib.escape(str(last['cos_alpha']))
+
+        finite = [float(value) for value in vec if np.isfinite(value)]
+        span = max((abs(value) for value in finite), default=25.0)
+        span = max(span, 1.0)
+        displayed = [(float(value) / span + 1.0) / 2.0 for value in vec]
+
         angles = np.linspace(0, 2*np.pi, len(AXES_LIST), endpoint=False).tolist()
-        values = vec + [vec[0]]
+        values = displayed + [displayed[0]]
         angles += [angles[0]]
-        
+
         fig, ax = plt.subplots(figsize=(10, 10), subplot_kw=dict(polar=True))
-        
-        # Wypełnienie
+
         ax.fill(angles, values, alpha=0.25, color='#9b59b6')
         ax.plot(angles, values, 'o-', linewidth=2, color='#9b59b6')
         
@@ -83,7 +96,9 @@ class SoulVisualizerV59:
         
         ax.set_xticks(angles[:-1])
         ax.set_xticklabels(labels, size=10)
-        ax.set_ylim(-25, 25)
+        ax.set_ylim(0, 1)
+        ax.set_yticks([0, 0.5, 1])
+        ax.set_yticklabels([f"{-span:.0f}", "0", f"{span:.0f}"])
         ax.set_title(f"Stan Duszy EriAmo v5.9\n{last['description']}", size=14, pad=20)
         ax.grid(True)
         
@@ -160,10 +175,10 @@ class SoulVisualizerV59:
     
     <div class="content">
         <h2>Aktualny Stan Duszy</h2>
-        <p><strong>Zdarzenie:</strong> {last['description']}</p>
-        <p><strong>Czas:</strong> {last['timestamp']}</p>
-        <p><strong>Interpretacja:</strong> {last['emotion_msg']}</p>
-        <p><strong>Geometria:</strong> cos(α) = {last['cos_alpha']}</p>
+        <p><strong>Zdarzenie:</strong> {safe_description}</p>
+        <p><strong>Czas:</strong> {safe_timestamp}</p>
+        <p><strong>Interpretacja:</strong> {safe_emotion}</p>
+        <p><strong>Geometria:</strong> cos(α) = {safe_cosine}</p>
         
         <div class="legend">
             <span class="ephemeral-tag">■ EFEMERYCZNE</span> - wygasają z czasem (emocje, czas) | 
@@ -224,7 +239,7 @@ class SoulVisualizerV59:
                     colorbar=dict(title="Czas")
                 ),
                 line=dict(color='rgba(100,100,200,0.6)', width=3),
-                text=[f"#{row['id_event']}: {row['description'][:30]}" for _, row in df.iterrows()],
+                text=[html_lib.escape(f"#{row['id_event']}: {str(row['description'])[:30]}") for _, row in df.iterrows()],
                 hoverinfo='text'
             )])
             
@@ -430,7 +445,7 @@ class SoulVisualizerV59:
     # ============= LISTA KOMPOZYCJI =============
     def list_compositions(self) -> list:
         """Wyświetla listę kompozycji."""
-        comp_dir = "compositions"
+        comp_dir = under_home("compositions")
         if not os.path.exists(comp_dir):
             print("Brak katalogu kompozycji.")
             return []

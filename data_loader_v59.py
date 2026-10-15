@@ -28,6 +28,11 @@ except ImportError:
     MUSICBRAINZ_AVAIL = False
 
 
+def _contains_term(text: str, term: str) -> bool:
+    """Cały wyraz albo fraza, nie fragment innego słowa."""
+    return re.search(r"(?<!\w)" + re.escape(term) + r"(?!\w)", text) is not None
+
+
 class ExternalKnowledgeLoader:
     """Loader wiedzy zewnętrznej z różnych źródeł."""
     
@@ -93,7 +98,7 @@ class ExternalKnowledgeLoader:
             ('miles davis', 'coltrane', 'monk', 'parker'): "JAZZ",
         }
         for k, v in style_map.items():
-            if any(w in text for w in k): features.add(v)
+            if any(_contains_term(text, w) for w in k): features.add(v)
         
         # === FORMA ===
         form_map = {
@@ -103,10 +108,12 @@ class ExternalKnowledgeLoader:
             ('sonata', 'etiuda'): "ZLOZONY", ('chaos',): "CHAOS", ('dramatic',): "DRAMATYCZNY"
         }
         for k, v in form_map.items():
-            if any(w in text for w in k): features.add(v)
-            
-        if 'major' in text or 'dur' in text: features.add("RADOSC")
-        if 'minor' in text or 'moll' in text: features.add("MELANCHOLIA")
+            if any(_contains_term(text, w) for w in k): features.add(v)
+
+        if _contains_term(text, "major") or _contains_term(text, "dur"):
+            features.add("RADOSC")
+        if _contains_term(text, "minor") or _contains_term(text, "moll"):
+            features.add("MELANCHOLIA")
         
         return list(features)
 
@@ -256,7 +263,8 @@ class ExternalKnowledgeLoader:
                     title_guess = full_text.strip()
                 
                 if title_guess or artist_guess:
-                    features.extend(self.get_context_from_web(artist_guess, title_guess))
+                    # Tekst z pliku zostaje lokalny. Sieć jest tylko dla !web.
+                    features.extend(self._analyze_text_heuristics(f"{artist_guess} {title_guess}"))
             
             # 3. STRUKTURA (Tempo/Tonacja)
             try:

@@ -11,6 +11,11 @@ def project_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
+# FluidR3_GM.sf2 z wydania ma około 148 MB. Krótszy plik w assets to urwany download.
+SOUNDFONT_MIN_BYTES = 140 * 1024 * 1024
+SOUNDFONT_URL = "https://github.com/pianobooster/fluid-soundfont/releases/download/v3.1/FluidR3_GM.sf2"
+
+
 def assets_soundfont_path() -> str:
     return os.path.join(project_dir(), "assets", "FluidR3_GM.sf2")
 
@@ -27,7 +32,8 @@ def soundfont_missing_message() -> str:
 def resolve_soundfont() -> str | None:
     """
     Kolejność: ERIAMO_SOUNDFONT, assets obok kodu, assets w katalogu roboczym,
-    potem typowe ścieżki systemowe. Plik krótszy niż 1 KB jest traktowany jako uszkodzony.
+    potem typowe ścieżki systemowe. Wskazany plik krótszy niż 1 KB odpada.
+    Bank w assets musi mieć co najmniej rozmiar pełnego FluidR3_GM.
     """
     candidates = []
     env_path = os.environ.get("ERIAMO_SOUNDFONT")
@@ -41,6 +47,7 @@ def resolve_soundfont() -> str | None:
         os.path.expanduser("~/Library/Audio/Sounds/Banks/FluidR3_GM.sf2"),
     ])
 
+    asset = os.path.abspath(assets_soundfont_path())
     seen = set()
     for path in candidates:
         if not path:
@@ -49,6 +56,11 @@ def resolve_soundfont() -> str | None:
         if norm in seen:
             continue
         seen.add(norm)
-        if os.path.isfile(norm) and os.path.getsize(norm) > 1000:
+        if not os.path.isfile(norm):
+            continue
+        size = os.path.getsize(norm)
+        if norm == asset and size >= SOUNDFONT_MIN_BYTES:
+            return norm
+        if norm != asset and size > 1000:
             return norm
     return None

@@ -49,17 +49,43 @@ ARCHITEKTURA DUSZY:
 │       └───────────────────────────────────┘            │
 └─────────────────────────────────────────────────────────┘
 """
+import math
 import numpy as np
 import threading
 import time
 import csv
 import os
+import shutil
 import tempfile
 import hashlib
 import json
 from dataclasses import dataclass, field
 from datetime import datetime
+from io import StringIO
 import pandas as pd
+
+
+def home_dir() -> str:
+    """Katalog danych. ERIAMO_HOME wygrywa, inaczej katalog tego pliku, nie cwd."""
+    override = os.environ.get("ERIAMO_HOME")
+    if override:
+        return os.path.abspath(override)
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def under_home(*parts: str) -> str:
+    return os.path.join(home_dir(), *parts)
+
+
+def finite_float(value):
+    """Liczba skończona albo None. NaN i nieskończoność odpadają."""
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(number):
+        return None
+    return number
 
 # =============================================================================
 # DEFINICJA ONTOLOGICZNA: 9 WEKTORÓW DUSZY
@@ -136,9 +162,17 @@ class MusicMemory:
     Odpowiada za konsolidację wiedzy z analizowanych utworów.
     """
     
-    DATA_DIR = "data"
-    H_LOG_PATH = "data/music_experience.json"   # Warstwa 1: surowe doświadczenia
-    D_MAP_PATH = "data/music_patterns.json"     # Warstwa 2: skonsolidowane wzorce
+    @property
+    def DATA_DIR(self) -> str:
+        return under_home("data")
+
+    @property
+    def H_LOG_PATH(self) -> str:
+        return under_home("data", "music_experience.json")
+
+    @property
+    def D_MAP_PATH(self) -> str:
+        return under_home("data", "music_patterns.json")
     
     # Cechy muzyczne które śledzimy
     MUSICAL_FEATURES = [
@@ -146,7 +180,7 @@ class MusicMemory:
         'leap_ratio',            # Stosunek skoków do kroków (0-1)
         'rhythmic_regularity',   # Regularność rytmiczna (0-1)
         'pitch_variance',        # Wariancja wysokości (0-1) - WAŻNE dla różnorodności!
-        'note_density',          # Gęstość nut na takt (0-1)
+        'note_density',          # Nuty na ćwiartkę, bez sufitu 1
         'interval_avg',          # Średni interwał (znormalizowany)
         'dominant_pitch_class',  # Dominująca klasa wysokości (0-11 → 0-1)
         'syncopation_feel',      # Poczucie synkopy (0-1)
@@ -180,6 +214,7 @@ class MusicMemory:
         self.last_sleep_time = time.time()
         self.sleep_count = 0
         self.experiences_since_sleep = 0
+        self._consolidated_index = 0
         
         # Wczytaj zapisane dane
         self._load_memory()
@@ -202,17 +237,37 @@ class MusicMemory:
         try:
             if os.path.exists(self.D_MAP_PATH):
                 with open(self.D_MAP_PATH, 'r', encoding='utf-8') as f:
-                    self.D_Map = json.load(f)
+                    raw = json.load(f)
+                if isinstance(raw, dict) and raw.get("version") == 2 and isinstance(raw.get("patterns"), dict):
+                    self.D_Map = raw["patterns"]
+                    self._consolidated_index = int(raw.get("consolidated_index", 0))
+                elif isinstance(raw, dict):
+                    self.D_Map = raw
+                    # Stary plik nie wie, co już skonsolidowano. Pusty słownik
+                    # znaczy, że H_log czeka na pierwszy sen.
+                    self._consolidated_index = len(self.H_log) if self.D_Map else 0
+                else:
+                    self.D_Map = {}
+                    self._consolidated_index = 0
         except Exception as e:
             print(f"\033[93m[MEMORY] Nie można wczytać D_Map: {e}\033[0m")
             self.D_Map = {}
+            self._consolidated_index = 0
+        self._consolidated_index = max(0, min(self._consolidated_index, len(self.H_log)))
     
     def _save_memory(self):
         """Zapisuje pamięć do plików. Zamek trzyma spójny odczyt H_log i D_Map."""
         with self._lock:
             try:
-                _atomic_write_json(self.H_LOG_PATH, self.H_log[-1000:])
-                _atomic_write_json(self.D_MAP_PATH, self.D_Map)
+                kept = self.H_log[-1000:]
+                dropped = len(self.H_log) - len(kept)
+                stored_index = max(0, min(len(kept), self._consolidated_index - dropped))
+                _atomic_write_json(self.H_LOG_PATH, kept)
+                _atomic_write_json(self.D_MAP_PATH, {
+                    "version": 2,
+                    "consolidated_index": stored_index,
+                    "patterns": self.D_Map,
+                })
             except Exception as e:
                 print(f"\033[91m[MEMORY] Błąd zapisu: {e}\033[0m")
     
@@ -223,7 +278,10 @@ class MusicMemory:
                 time.sleep(self.sleep_interval)
                 if not self.running:
                     break
-                self._sleep()
+                try:
+                    self._sleep()
+                except Exception as exc:
+                    print(f"\033[91m[SEN] Przerwany, wątek zostaje: {exc}\033[0m")
         
         thread = threading.Thread(target=cycle, daemon=True)
         thread.start()
@@ -253,52 +311,42 @@ class MusicMemory:
         
         self.is_sleeping = True
         start_time = time.time()
-        
-        print(f"\n\033[96m[SEN] 💤 Zasypiam... przetwarzam {len(self.H_log)} doświadczeń...\033[0m")
-        
         processed = 0
         consolidated = 0
-        
-        # Przetwarzaj ostatnie doświadczenia (max 20)
-        recent_experiences = self.H_log[-20:]
-        
-        for exp in recent_experiences:
-            if time.time() - start_time > 5.0:  # Max 5 sekund snu
-                break
-            
-            # Wyodrębnij wzorzec
-            pattern_key = self._extract_pattern_key(exp)
-            
-            if pattern_key in self.D_Map:
-                # Wzmocnij istniejący wzorzec
-                self.D_Map[pattern_key]['weight'] = min(
-                    self.D_Map[pattern_key]['weight'] + 1.0, 
-                    100.0
-                )
-                self.D_Map[pattern_key]['reinforced_count'] += 1
-                consolidated += 1
-            else:
-                # Dodaj nowy wzorzec
-                self.D_Map[pattern_key] = {
-                    'features': exp.get('features', {}),
-                    'weight': 1.0,
-                    'source': exp.get('source', 'unknown'),
-                    'created_at': datetime.now().isoformat(),
-                    'reinforced_count': 0
-                }
-                processed += 1
-        
-        # Deduplikacja - połącz bardzo podobne wzorce
-        self._deduplicate_patterns()
-        
-        # Zapisz
-        self._save_memory()
-        
-        # Aktualizuj stan
-        self.last_sleep_time = time.time()
-        self.sleep_count += 1
-        self.experiences_since_sleep = 0
-        self.is_sleeping = False
+        try:
+            pending = self.H_log[self._consolidated_index:]
+            print(f"\n\033[96m[SEN] 💤 Zasypiam... przetwarzam {len(pending)} nowych doświadczeń...\033[0m")
+            consumed = 0
+            for exp in pending:
+                if time.time() - start_time > 5.0:
+                    break
+                pattern_key = self._extract_pattern_key(exp)
+                features = exp.get('features', {})
+                if not isinstance(features, dict):
+                    features = {}
+                consumed += 1
+                if pattern_key in self.D_Map:
+                    pattern = self.D_Map[pattern_key]
+                    pattern['weight'] = min(float(pattern.get('weight', 0.0)) + 1.0, 100.0)
+                    pattern['reinforced_count'] = int(pattern.get('reinforced_count', 0)) + 1
+                    consolidated += 1
+                else:
+                    self.D_Map[pattern_key] = {
+                        'features': features,
+                        'weight': 1.0,
+                        'source': exp.get('source', 'unknown'),
+                        'created_at': datetime.now().isoformat(),
+                        'reinforced_count': 0
+                    }
+                    processed += 1
+            self._consolidated_index += consumed
+            self._deduplicate_patterns()
+            self.last_sleep_time = time.time()
+            self.sleep_count += 1
+            self.experiences_since_sleep = len(self.H_log) - self._consolidated_index
+        finally:
+            self.is_sleeping = False
+            self._save_memory()
         
         duration = time.time() - start_time
         print(f"\033[92m[SEN] ✨ Obudziłem się! +{processed} nowych wzorców, +{consolidated} wzmocnionych ({duration:.1f}s)\033[0m")
@@ -353,6 +401,7 @@ class MusicMemory:
                     else:
                         self.D_Map[k2]['weight'] += self.D_Map[k1]['weight'] * 0.5
                         merged.add(k1)
+                        break
         
         # Usuń połączone
         for k in merged:
@@ -489,9 +538,11 @@ class MusicMemory:
         """Zatrzymuje cykl snu, scala zaległe doświadczenia i zapisuje pamięć."""
         with self._lock:
             self.running = False
-            if self.experiences_since_sleep > 0 and self.H_log:
-                self._consolidate_locked()
-            else:
+            self.is_sleeping = False
+            try:
+                if self.H_log and self._consolidated_index < len(self.H_log):
+                    self._consolidate_locked()
+            finally:
                 self._save_memory()
         print(f"\033[93m[MEMORY] Pamięć zapisana. Dobranoc.\033[0m")
 
@@ -545,15 +596,24 @@ def _learning_features_from_score(score) -> dict:
             key_tonic = 0  # C
             key_mode = 1.0  # major
 
+        # Jedna linia melodyczna: najwyższy dźwięk na każde uderzenie.
+        # Dźwięki tego samego offsetu nie są interwałami melodii.
+        onsets = {}
         for element in score.flatten().notes:
+            offset = round(float(element.offset), 6)
             if isinstance(element, m21_note.Note):
-                notes.append(element.pitch.midi)
-                timings.append(float(element.offset))
+                pitches = [element.pitch.midi]
             elif isinstance(element, m21_chord.Chord):
-                # Dla akordów bierzemy wszystkie nuty
-                for pitch in element.pitches:
-                    notes.append(pitch.midi)
-                    timings.append(float(element.offset))
+                pitches = [pitch.midi for pitch in element.pitches]
+            else:
+                continue
+            top = max(pitches)
+            previous = onsets.get(offset)
+            if previous is None or top > previous:
+                onsets[offset] = top
+        for offset in sorted(onsets):
+            notes.append(onsets[offset])
+            timings.append(offset)
                     
     except ImportError:
         print("\033[91m[ANALYZE] Brak music21! Zainstaluj: pip install music21\033[0m")
@@ -593,9 +653,10 @@ def _learning_features_from_score(score) -> dict:
     pitch_variance = np.std(notes) / 12.0 if len(notes) > 1 else 0.5
     features['pitch_variance'] = min(1.0, pitch_variance)
     
-    # 5. Gęstość nut (na "takt" - aproksymacja)
-    if timings and max(timings) > 0:
-        features['note_density'] = min(1.0, len(notes) / (max(timings) + 1))
+    # 5. Nuty na ćwiartkę. Ćwierćnuty dają 1, ósemki 2, całe nuty 0.25.
+    span = max(timings) - min(timings) if len(timings) > 1 else 0.0
+    if span > 0:
+        features['note_density'] = (len(notes) - 1) / span
     else:
         features['note_density'] = 0.5
     
@@ -698,13 +759,8 @@ ETHICS_FRAMEWORK = {
 
 def get_ethics_check(action: str) -> bool:
     """
-    Sprawdza czy działanie jest zgodne ze szkieletem etycznym.
-    Zwraca True jeśli działanie jest etyczne, False jeśli nie.
-    
-    Przykłady działań nieetycznych:
-    - Plagiat (narusza integrity)
-    - Celowe tworzenie hałasu dla bólu (narusza harmony)
-    - Manipulacja emocjonalna (narusza respect)
+    Pomocnik słownikowy. Nie jest wołany przy nauce ani kompozycji
+    i nie filtruje gatunków. Szkielet etyczny zostaje metadanymi duszy.
     """
     unethical_keywords = [
         "plagiat", "kradzież", "manipulacja", "destrukcja",
@@ -766,24 +822,70 @@ class SoulVector:
 
 class SoulStateLogger:
     """Logger zapisujący historię stanów duszy do CSV z bezpieczną migracją."""
-    FILE_PATH = "data/soul_history.csv"
+
+    @property
+    def FILE_PATH(self) -> str:
+        return under_home("data", "soul_history.csv")
     
     # Definicja kolejności kolumn (zaktualizowana: etyka → improwizacja)
     HEADER = ["timestamp", "id_event", "description", "mode", "cos_alpha", "compression", "emotion_msg"] + \
              [f"S_{axis}" for axis in AXES_LIST] + [f"F_{axis}" for axis in AXES_LIST]
 
     def __init__(self):
-        os.makedirs("data", exist_ok=True)
+        os.makedirs(os.path.dirname(self.FILE_PATH), exist_ok=True)
         self.event_counter = 0
         self._known_last_id = 0
         self._initialize_and_migrate_file()
         self.event_counter = self._known_last_id
 
-    def _initialize_and_migrate_file(self):
+    def _write_csv_text(self, text: str) -> None:
+        directory = os.path.dirname(os.path.abspath(self.FILE_PATH))
+        os.makedirs(directory, exist_ok=True)
+        fd, tmp_path = tempfile.mkstemp(prefix=".eriamo-", suffix=".csv", dir=directory)
+        try:
+            with os.fdopen(fd, "w", newline="", encoding="utf-8") as handle:
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, self.FILE_PATH)
+        except Exception:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise
+
+    def _recover_history(self) -> bool:
+        """Kopia uszkodzonego pliku i odrzucenie urwanej ostatniej linii, jeśli reszta jest CSV."""
+        source = self.FILE_PATH
+        backup = source + ".broken"
+        index = 1
+        while os.path.exists(backup):
+            backup = f"{source}.broken-{index}"
+            index += 1
+        shutil.copy2(source, backup)
+        print(f"[ERROR] Plik historii uszkodzony. Kopia: {backup}")
+        with open(source, "r", encoding="utf-8", errors="replace") as handle:
+            lines = [line for line in handle.read().splitlines() if line.strip()]
+        candidates = []
+        if len(lines) > 1:
+            candidates.append(lines[:-1])
+        if lines:
+            candidates.append(lines)
+        for candidate in candidates:
+            blob = "\n".join(candidate) + "\n"
+            try:
+                pd.read_csv(StringIO(blob))
+            except (pd.errors.EmptyDataError, pd.errors.ParserError):
+                continue
+            self._write_csv_text(blob)
+            return True
+        return False
+
+    def _initialize_and_migrate_file(self, allow_recover: bool = True):
         """Inicjalizuje plik lub wykonuje migrację struktury. Ostatni numer zdarzenia zostaje w pamięci."""
         if not os.path.exists(self.FILE_PATH) or os.path.getsize(self.FILE_PATH) == 0:
-            with open(self.FILE_PATH, 'w', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow(self.HEADER)
+            self._write_csv_text(",".join(self.HEADER) + "\n")
             return
 
         try:
@@ -817,9 +919,16 @@ class SoulStateLogger:
                 self._known_last_id = int(df.iloc[-1]["id_event"])
                 
         except (pd.errors.EmptyDataError, pd.errors.ParserError):
-            print("[ERROR] Plik historii uszkodzony. Tworzenie nowego.")
-            with open(self.FILE_PATH, 'w', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow(self.HEADER)
+            if not allow_recover:
+                print("[ERROR] Odzyskany plik historii nadal jest nieczytelny. Zaczynam od nagłówka.")
+                self._write_csv_text(",".join(self.HEADER) + "\n")
+                return
+            if self._recover_history():
+                self._initialize_and_migrate_file(allow_recover=False)
+                return
+            print("[ERROR] Nie udało się odzyskać historii. Zostawiam kopię i zaczynam od nagłówka.")
+            self._write_csv_text(",".join(self.HEADER) + "\n")
+            return
         except Exception as e:
             print(f"[ERROR] Błąd weryfikacji historii: {e}")
 
@@ -833,8 +942,10 @@ class SoulStateLogger:
                    f"{cos_alpha:.4f}", comp_status, emotion_msg] + \
                   core.get_vector_copy().tolist() + F_vector.tolist()
             
-            with open(self.FILE_PATH, 'a', newline='', encoding='utf-8') as f:
-                csv.writer(f).writerow(row)
+            with open(self.FILE_PATH, 'a', newline='', encoding='utf-8') as handle:
+                csv.writer(handle).writerow(row)
+                handle.flush()
+                os.fsync(handle.fileno())
             
             if compressed:
                 core.log(f"[AUDYT] Stan #{self.event_counter} SKOMPRESOWANY (Redundancja).", "GRAY")
@@ -848,7 +959,10 @@ class SoulStateLogger:
 class EriAmoCore:
     """Rdzeń ontologiczny duszy muzycznej."""
     AXES = AXES_LIST
-    HISTORY_PATH = "data/soul_history.csv"
+
+    @property
+    def HISTORY_PATH(self) -> str:
+        return under_home("data", "soul_history.csv")
     
     # Konfiguracja wygaszania osi efemerycznych
     DECAY_CONFIG = {
@@ -890,21 +1004,29 @@ class EriAmoCore:
         try:
             df = pd.read_csv(self.HISTORY_PATH)
             if df.empty: return False
-            last_row = df.iloc[-1]
-            new_values = []
-            for axis in self.AXES:
-                col_name = f"S_{axis}"
-                if col_name in last_row:
-                    new_values.append(float(last_row[col_name]))
-                else:
-                    # Fallback dla migracji etyka → improwizacja
-                    if axis == "improwizacja" and "S_etyka" in last_row:
-                        old_etyka = float(last_row["S_etyka"])
-                        new_values.append(50.0 - old_etyka * 0.5)
+            for row_index in range(len(df) - 1, -1, -1):
+                row = df.iloc[row_index]
+                new_values = []
+                complete = True
+                for axis in self.AXES:
+                    col_name = f"S_{axis}"
+                    if col_name in row and not pd.isna(row[col_name]):
+                        number = finite_float(row[col_name])
+                    elif axis == "improwizacja" and "S_etyka" in row:
+                        old_etyka = finite_float(row["S_etyka"])
+                        number = None if old_etyka is None else 50.0 - old_etyka * 0.5
+                    elif col_name not in row:
+                        number = 0.0
                     else:
-                        new_values.append(0.0)
-            self.vector.values = np.array(new_values)
-            return True
+                        number = None
+                    if number is None:
+                        complete = False
+                        break
+                    new_values.append(number)
+                if complete:
+                    self.vector.values = np.array(new_values, dtype=float)
+                    return True
+            return False
         except Exception as e:
             self.log(f"[BŁĄD WCZYTYWANIA] {e}", "RED")
             return False
@@ -968,6 +1090,9 @@ class EriAmoCore:
                 config = self.DECAY_CONFIG[axis]
                 idx = self.AXES.index(axis)
                 old_val = self.vector.values[idx]
+                if not math.isfinite(float(old_val)):
+                    self.vector.values[idx] = 0.0
+                    continue
                 decay_factor = (1 - config['rate']) ** cycles
                 new_val = old_val * decay_factor
                 if config['floor'] is not None:
@@ -1028,11 +1153,12 @@ class EriAmoCore:
             }
 
     def create_memory_dump(self, filename: str = None) -> str:
-        os.makedirs("data/dumps", exist_ok=True)
+        folder = under_home("data", "dumps")
+        os.makedirs(folder, exist_ok=True)
         if filename is None:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
             filename = f"soul_dump_{timestamp}.soul"
-        filepath = f"data/dumps/{filename}"
+        filepath = os.path.join(folder, filename)
         
         with self.lock:
             dump_data = {
@@ -1058,19 +1184,25 @@ class EriAmoCore:
 
     def load_memory_dump(self, filepath: str) -> bool:
         try:
-            with open(filepath, 'r', encoding='utf-8') as f: data = json.load(f)
+            with open(filepath, 'r', encoding='utf-8') as handle:
+                data = json.load(handle)
+            soul = data['soul_vector']
+            if 'decay_status' not in data:
+                raise KeyError('decay_status')
+            new_values = self.get_vector_copy()
+            for axis, val in soul.items():
+                number = finite_float(val)
+                if number is None:
+                    raise ValueError(f"oś {axis} nie jest skończoną liczbą")
+                if axis in self.AXES:
+                    new_values[self.AXES.index(axis)] = number
+                elif axis == "etyka" and "improwizacja" not in soul:
+                    new_values[self.AXES.index('improwizacja')] = 50.0 - number * 0.5
+            cycles = int(data['decay_status'].get('cycles_applied', 0))
             with self.lock:
-                for axis, val in data['soul_vector'].items():
-                    if axis in self.AXES:
-                        self.vector.values[self.AXES.index(axis)] = float(val)
-                    # Migracja ze starego formatu
-                    elif axis == "etyka" and "improwizacja" not in data['soul_vector']:
-                        improv_val = 50.0 - float(val) * 0.5
-                        self.vector.values[self.AXES.index('improwizacja')] = improv_val
-                        
-                self.decay_cycle_count = data['decay_status'].get('cycles_applied', 0)
-            
-            if data['meta'].get('integrity_hash', '') == self.compute_integrity_hash():
+                self.vector.values = np.array(new_values, dtype=float)
+                self.decay_cycle_count = cycles
+            if data.get('meta', {}).get('integrity_hash', '') == self.compute_integrity_hash():
                 self.log(f"[DUMP] Zweryfikowano: {filepath}", "GREEN")
             else:
                 self.log(f"[DUMP] Wczytano (Hash Mismatch - możliwa migracja): {filepath}", "YELLOW")
@@ -1175,7 +1307,7 @@ class CuriosityEngine:
     
     def __init__(self):
         self.boredom_counter = {}  # Licznik powtórzeń gatunków
-        self.discovery_cooldown = 0  # Czas od ostatniego odkrycia
+        self.discovery_cooldown = None  # None = nigdy; 0 = odkrycie przed chwilą
         self.last_genres = []  # Historia ostatnich gatunków
         
     def compute_curiosity(self, kreacja: float, wiedza: float, emocje: float) -> dict:
@@ -1255,7 +1387,8 @@ class CuriosityEngine:
     
     def _compute_discovery_penalty(self) -> float:
         """Oblicza penalty za niedawne odkrycie (zaspokojenie)."""
-        # Penalty maleje z czasem
+        if self.discovery_cooldown is None:
+            return 0.0
         return max(0, 20 - self.discovery_cooldown * 5)
     
     def register_composition(self, genre: str, was_novel: bool = False):
@@ -1273,9 +1406,10 @@ class CuriosityEngine:
         # Aktualizuj licznik znudzenia
         self.boredom_counter[genre] = self.boredom_counter.get(genre, 0) + 1
         
-        # Odkrycie resetuje cooldown
         if was_novel:
             self.discovery_cooldown = 0
+        elif self.discovery_cooldown is None:
+            self.discovery_cooldown = 1
         else:
             self.discovery_cooldown += 1
     

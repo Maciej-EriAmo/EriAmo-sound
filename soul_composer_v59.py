@@ -21,6 +21,7 @@ from amocore_v59 import (
     get_curiosity_engine,
     get_music_memory,
     interpret_improv_for_composition,
+    under_home,
 )
 from composer_genres import GenreMixin
 from composer_menuet import MenuetMixin
@@ -38,7 +39,17 @@ elif not PYDUB_AVAIL:
 
 
 class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
-    OUTPUT_DIR = "compositions"
+    # Ćwierćnuty to około 1 nuty na ćwiartkę. Szybciej niż to przyspiesza, wolniej zwalnia.
+    DENSE_NOTES_PER_QUARTER = 1.5
+    SPARSE_NOTES_PER_QUARTER = 0.5
+    GENERATED_GENRES = frozenset({
+        "POWER_METAL", "HEAVY_METAL", "BLUES", "ROCK_AND_ROLL",
+        "MENUET", "WALC", "KANON", "LAMENT", "AMBIENT",
+    })
+
+    @property
+    def OUTPUT_DIR(self) -> str:
+        return under_home("compositions")
 
     CHORD_MAP = {
         "maj": [0, 4, 7],
@@ -101,10 +112,10 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
         time_val = metrics["czas"] + base_tempo_mod
         style = metrics.get("memory_style") or {}
         if style.get("has_data"):
-            density = float(style.get("note_density", 0.5))
-            if density >= 0.66:
+            density = float(style.get("note_density", 1.0))
+            if density >= self.DENSE_NOTES_PER_QUARTER:
                 time_val += 12
-            elif density <= 0.34:
+            elif density <= self.SPARSE_NOTES_PER_QUARTER:
                 time_val -= 12
         opts_fast = [0.25, 0.5, 0.5, 1.0]
         opts_med = [0.5, 1.0, 1.0, 2.0]
@@ -190,10 +201,10 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
         """Gęsty plik dzieli długie nuty, rzadki łączy je parami. Długość taktu zostaje."""
         if not style or not style.get("has_data"):
             return measures
-        density = float(style.get("note_density", 0.5))
-        if density >= 0.66:
+        density = float(style.get("note_density", 1.0))
+        if density >= self.DENSE_NOTES_PER_QUARTER:
             return [self._split_long_notes(m) for m in measures]
-        if density <= 0.34:
+        if density <= self.SPARSE_NOTES_PER_QUARTER:
             return [self._merge_note_pairs(m) for m in measures]
         return measures
 
@@ -277,6 +288,15 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
             instrument_override = None
         return genre_name, instrument_override
 
+    def _require_generator(self, genre_name: str) -> None:
+        if genre_name in self.GENERATED_GENRES:
+            return
+        known = ", ".join(sorted(self.GENERATED_GENRES))
+        raise ValueError(
+            f"Gatunek {genre_name} jest w katalogu, ale nie ma generatora. "
+            f"Kompozycja dostępna dla: {known}"
+        )
+
     def compose_new_work(self, genre_name: str, instrument_override: str = None, tonic: str = None) -> dict:
         """
         Komponuje nowy utwór.
@@ -285,6 +305,7 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
         zanim dusza albo pliki zostaną zmienione.
         """
         genre_name, instrument_override = self._normalize_request(genre_name, instrument_override)
+        self._require_generator(genre_name)
 
         curiosity_before = compute_curiosity_from_soul(self.core)
         recommendation = curiosity_before.get("recommendation", {})
@@ -374,8 +395,15 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
             elif paths.get("wav"):
                 handle.write(f"\nAudio: Wygenerowano WAV ({os.path.basename(paths['wav'])})\n")
 
+        _redundant, cos_alpha = self.core.check_ontological_compression(f_intencja)
+        instrument_label = instrument_override if instrument_override else "Auto"
         self.logger.log_state(
-            self.core, f_intencja, 1.0, f"Kompozycja {genre_name}", "COMPOSE", "!compose"
+            self.core,
+            f_intencja,
+            float(cos_alpha),
+            f"Kompozycja {genre_name}",
+            f"{genre_name} / {instrument_label}",
+            "!compose",
         )
         get_curiosity_engine().register_composition(
             genre_name,

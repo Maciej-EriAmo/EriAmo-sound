@@ -5,16 +5,49 @@
 # (at your option) any later version.
 """Zapis partytury Music21 i render audio."""
 import os
+import shutil
 
-from composer_runtime import AUDIO_AVAIL, MUSIC21_AVAIL, music21, FluidSynth, AudioSegment
+from composer_runtime import MUSIC21_AVAIL, music21, FluidSynth, AudioSegment
 from instruments import midi_program
 from soundfont import resolve_soundfont, soundfont_missing_message
 
 
+def _write_wav(midi_path: str, wav_path: str, soundfont: str) -> bool:
+    """WAV przez EriAmo-midi. Program fluidsynth tylko wtedy, gdy jest w PATH."""
+    from midi_windows import render_with_player
+
+    outcome = render_with_player(midi_path, wav_path)
+    if outcome == "ok" and os.path.isfile(wav_path):
+        return True
+    if outcome not in ("ok", "missing-player"):
+        print(f"[AUDIO] {outcome}")
+    if FluidSynth is not None and shutil.which("fluidsynth"):
+        try:
+            FluidSynth(soundfont).midi_to_audio(midi_path, wav_path)
+        except OSError as exc:
+            print(f"[AUDIO] Brak programu fluidsynth ({exc}). Zostaje MIDI.")
+            return False
+        except Exception as exc:
+            print(f"[AUDIO] Render nieudany: {exc}")
+            return os.path.isfile(wav_path)
+        return os.path.isfile(wav_path)
+    print("[AUDIO] Nie ma programu fluidsynth. Zostaje MIDI, odtwarzanie przez EriAmo-midi.")
+    return False
+
+
 class ScoreMixin:
+    def _pad_measure(self, measure, events, meter_quarters: float) -> None:
+        """Pusty albo krótki takt dostaje pauzę, żeby MIDI nie skleiło następnego."""
+        filled = sum(float(event.get("duration", 0)) for event in events)
+        missing = meter_quarters - filled
+        if missing > 1e-6:
+            rest = music21.note.Rest()
+            rest.quarterLength = missing
+            measure.append(rest)
+
     def _render_audio(self, midi_path: str) -> dict:
         """Konwertuje MIDI na WAV. OGG i FLAC powstają, gdy jest pydub."""
-        if not AUDIO_AVAIL or FluidSynth is None:
+        if os.environ.get("ERIAMO_SKIP_WAV") == "1":
             return {}
         soundfont = resolve_soundfont()
         if not soundfont:
@@ -27,24 +60,27 @@ class ScoreMixin:
         flac_path = f"{base_path}.flac"
 
         paths = {}
+        if not _write_wav(midi_path, wav_path, soundfont):
+            return paths
+        paths["wav"] = wav_path
+        if AudioSegment is None:
+            print("[AUDIO] Zostawiam WAV. OGG i FLAC wymagają pydub.")
+            return paths
         try:
-            fs = FluidSynth(soundfont)
-            fs.midi_to_audio(midi_path, wav_path)
-            if not os.path.exists(wav_path):
-                return paths
-            if AudioSegment is None:
-                print("[AUDIO] Zostawiam WAV. OGG i FLAC wymagają pydub.")
-                paths["wav"] = wav_path
-                return paths
             audio = AudioSegment.from_wav(wav_path)
+        except Exception as exc:
+            print(f"[AUDIO] Zostawiam WAV. Odczyt nieudany: {exc}")
+            return paths
+        try:
             audio.export(ogg_path, format="ogg")
             paths["ogg"] = ogg_path
+        except Exception as exc:
+            print(f"[AUDIO] OGG pominięty ({exc}). Zostaje WAV. Do OGG potrzebny jest ffmpeg.")
+        try:
             audio.export(flac_path, format="flac")
             paths["flac"] = flac_path
-            os.remove(wav_path)
-        except Exception as e:
-            print(f"[AUDIO ERROR] Błąd renderowania: {e}")
-
+        except Exception as exc:
+            print(f"[AUDIO] FLAC pominięty ({exc}). Zostaje WAV. Do FLAC potrzebny jest ffmpeg.")
         return paths
 
     def _create_music21_score(self, data: dict, genre_name: str, instrument_override: str = None):
@@ -60,22 +96,7 @@ class ScoreMixin:
         md.composer = "EriAmo AI v5.9"
         score.insert(0, md)
 
-        # Instrument i Tempo
-        # 
-        # WYBÓR INSTRUMENTU DLA MENUETU:
-        # Program 6 = Harpsichord (klawesyn) - historycznie poprawny dla XVIII w.
-        # 
-        # Menuety w stylu Riepela (1709-1782) były komponowane na:
-        # - Klawesyn (clavecin) - najpopularniejszy w epoce baroku/galant
-        # - Fortepian wczesny (Hammerklavier) - od ok. 1770
-        # - Zespół kameralny (smyczki + continuo)
-        #
-        # Alternatywy (można użyć instrument_override):
-        # - 'piano' (0) - fortepian współczesny
-        # - 'bright_piano' (1) - jasny fortepian  
-        # - 'organ' (19) - organy pozytywne
-        # - 'strings' (48) - smyczki
-        #
+        # Program 6 to klawesyn, domyślna barwa menueta.
         midi_prog = 0
         if instrument_override:
             midi_prog = midi_program(instrument_override)
@@ -91,7 +112,7 @@ class ScoreMixin:
             midi_prog = 6   # Harpsichord (klawesyn) - autentyczny dla epoki
 
         bpm_map = {
-            "POWER_METAL": 170, "HEAVY_METAL": 110, "ROCK_AND_ROLL": 160, "BLUES": 90,
+            "POWER_METAL": 170, "HEAVY_METAL": 110, "ROCK_AND_ROLL": 120, "BLUES": 90,
             "MENUET": 116, "WALC": 168, "LAMENT": 50, "AMBIENT": 60
         }
         bpm = bpm_map.get(genre_name, 120)
@@ -102,7 +123,7 @@ class ScoreMixin:
             "MENUET": "Tempo di Menuetto",
             "WALC": "Tempo di Valse",
             "LAMENT": "Adagio lamentoso",
-            "ROCK_AND_ROLL": "Allegro energico"
+            "ROCK_AND_ROLL": "Allegro moderato"
         }.get(genre_name, "Moderato")
 
         # Sprawdź czy mamy strukturę z powtórzeniami (menuet Riepela)
@@ -119,6 +140,7 @@ class ScoreMixin:
         inst.midiProgram = midi_prog
         p1.insert(0, inst)
         meter = "3/4" if genre_name in ("MENUET", "WALC") else "4/4"
+        meter_quarters = 3.0 if meter == "3/4" else 4.0
         p1.insert(0, music21.meter.TimeSignature(meter))
 
         # Budowanie taktów z numeracją
@@ -171,6 +193,8 @@ class ScoreMixin:
 
                     m.append(n)
                     notes_in_measure.append(n)
+
+            self._pad_measure(m, m_data, meter_quarters)
 
             # Frazy (Slur) - Riepel: frazy 4-taktowe
             if genre_name == "MENUET" and notes_in_measure:
@@ -240,6 +264,7 @@ class ScoreMixin:
                     if genre_name == "MENUET" and n.quarterLength >= 1.0:
                         n.articulations.append(music21.articulations.Tenuto())
                     m.append(n)
+            self._pad_measure(m, m_data, meter_quarters)
             p2.append(m)
             measure_num += 1
 

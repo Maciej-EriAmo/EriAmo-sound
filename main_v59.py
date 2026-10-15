@@ -12,7 +12,7 @@ EriAmo v5.9 - Główny Interfejs CLI (UPDATE)
 """
 import shlex
 
-from amocore_v59 import AXES_LIST, EPHEMERAL_AXES
+from amocore_v59 import AXES_LIST, EPHEMERAL_AXES, under_home
 from genre_definitions import GENRE_DEFINITIONS, list_genres
 from instruments import list_instrument_names
 from session import EriAmoSession
@@ -64,9 +64,37 @@ def print_help():
     print("  !decay N                     - Ręczne wygaszanie (N cykli)")
     print("  !decay_status                - Stan systemu")
     
+    print("\n🔊 ODTWARZANIE (Windows):")
+    print("  !play                        - Ostatnie MIDI (EriAmo-midi albo syntezator Windows)")
+    print("  !play ŚCIEŻKA                - Wskazany plik MIDI")
+    print("  !stop                        - Zatrzymaj odtwarzanie")
     print("\n🔍 INNE:")
     print("  !report, !trajectory, !status, !compare")
     print("="*70 + "\n")
+
+def _announce_windows_midi(paths: dict) -> None:
+    """Gra zapisane MIDI, gdy nie powstał WAV."""
+    try:
+        from midi_windows import play_composed_midi
+        message = play_composed_midi(paths)
+    except Exception as exc:
+        print(f"  MIDI zapisane. Odtwarzanie Windows nieudane: {exc}")
+        return
+    if message:
+        print(f"  {message}")
+
+
+def _play_command(path: str | None) -> None:
+    from midi_windows import newest_midi, play_midi, playback_label
+
+    try:
+        target = path if path else newest_midi(under_home("compositions"))
+        played = play_midi(target)
+    except Exception as exc:
+        print(f"❌ {exc}")
+        return
+    print(f"Odtwarzam ({playback_label()}): {played}")
+
 
 def main():
     print_banner()
@@ -119,6 +147,7 @@ def _command_loop(session, core):
                     print("="*60)
                     for key, path in paths.items():
                         if path: print(f"  {key.upper():4}: {path}")
+                    _announce_windows_midi(paths)
                     print("="*60 + "\n")
                 except ValueError as e:
                     print(f"❌ {e}")
@@ -135,6 +164,16 @@ def _command_loop(session, core):
             elif cmd == "!file":
                 if len(parts) < 2: print("❌ Użycie: !file ścieżka"); continue
                 session.learn_file(parts[1])
+
+            elif cmd == "!play":
+                _play_command(parts[1] if len(parts) > 1 else None)
+
+            elif cmd == "!stop":
+                from midi_windows import stop_midi
+                if stop_midi():
+                    print("Zatrzymano odtwarzanie MIDI.")
+                else:
+                    print("Nic nie jest odtwarzane.")
             
             elif cmd == "!genres":
                 print("\n📚 DOSTĘPNE GATUNKI:")
