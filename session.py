@@ -46,13 +46,16 @@ class EriAmoSession:
 
     def learn_file(self, path: str):
         """Cechy ontologiczne oraz zapis wzorca do pamięci snu. Plik czyta raz."""
+        if os.path.isdir(path):
+            self.core.log(f"[NUTY] To katalog, nie plik: {path}", "RED")
+            return [], {}
         if not os.path.isfile(path):
             self.core.log(f"[NUTY] Brak pliku: {path}", "RED")
-            return [], False
+            return [], {}
         score = self.loader.open_score(path)
         if score is None:
             self.core.log(self._learning_line([], {}), "YELLOW")
-            return [], False
+            return [], {}
         features = self.loader.features_from_score(score)
         if features:
             self.analyzer.analyze_and_shift(
@@ -60,7 +63,7 @@ class EriAmoSession:
             )
         note_memory = learn_from_score(score, os.path.basename(path))
         self.core.log(self._learning_line(features, note_memory), "CYAN")
-        return features, bool(note_memory)
+        return features, note_memory
 
     def _learning_line(self, features, note_memory) -> str:
         """Jedna linia: co weszło do duszy i co weszło do pamięci nut."""

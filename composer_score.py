@@ -36,6 +36,36 @@ def _write_wav(midi_path: str, wav_path: str, soundfont: str) -> bool:
 
 
 class ScoreMixin:
+    def _fit_events(self, events, meter_quarters: float) -> list:
+        """Skraca nadmiar taktu od końca. Wysokości zostają."""
+        fitted = []
+        for event in events:
+            copied = dict(event)
+            if isinstance(copied.get("pitch"), list):
+                copied["pitch"] = list(copied["pitch"])
+            fitted.append(copied)
+        total = sum(float(event.get("duration", 0)) for event in fitted)
+        overflow = total - meter_quarters
+        if overflow <= 1e-6:
+            return fitted
+        for event in reversed(fitted):
+            duration = float(event.get("duration", 0))
+            room = duration - 0.25
+            if room <= 1e-9:
+                continue
+            cut = min(room, overflow)
+            event["duration"] = duration - cut
+            overflow -= cut
+            if overflow <= 1e-6:
+                break
+        if overflow > 1e-6:
+            total = sum(float(event.get("duration", 0)) for event in fitted)
+            if total > meter_quarters and total > 0:
+                factor = meter_quarters / total
+                for event in fitted:
+                    event["duration"] = float(event.get("duration", 0)) * factor
+        return fitted
+
     def _pad_measure(self, measure, events, meter_quarters: float) -> None:
         """Pusty albo krótki takt dostaje pauzę, żeby MIDI nie skleiło następnego."""
         filled = sum(float(event.get("duration", 0)) for event in events)
@@ -167,32 +197,28 @@ class ScoreMixin:
                     # Koniec części B - znak powtórzenia
                     m.rightBarline = music21.bar.Repeat(direction='end')
 
-            # Dodaj nuty
+            # Dodaj nuty. Prawa ręka Würfelspiel ma też akordy.
+            m_data = self._fit_events(m_data, meter_quarters)
             notes_in_measure = []
             for ev in m_data:
                 if ev.get('type') == 'rest':
-                    # Pauza
                     r = music21.note.Rest()
                     r.quarterLength = ev['duration']
                     m.append(r)
+                    continue
+                vel = {'ppp': 30, 'pp': 40, 'p': 50, 'mp': 64, 'mf': 80, 'f': 96, 'ff': 112}.get(ev.get('dynamic', 'mf'), 80)
+                if ev.get('type') == 'chord':
+                    n = music21.chord.Chord(ev['pitch'])
                 else:
                     n = music21.note.Note(ev['pitch'])
-                    n.quarterLength = ev['duration']
-
-                    # Dynamika
-                    vel = {'ppp': 30, 'pp': 40, 'p': 50, 'mp': 64, 'mf': 80, 'f': 96, 'ff': 112}.get(ev.get('dynamic', 'mf'), 80)
-                    n.volume.velocity = vel
-
-                    # Fermata
-                    if ev.get('fermata', False):
-                        n.expressions.append(music21.expressions.Fermata())
-
-                    # Artykulacja (Staccato dla krótkich w Menuecie)
-                    if genre_name == "MENUET" and n.quarterLength <= 0.5:
-                        n.articulations.append(music21.articulations.Staccato())
-
-                    m.append(n)
-                    notes_in_measure.append(n)
+                n.quarterLength = ev['duration']
+                n.volume.velocity = vel
+                if ev.get('fermata', False):
+                    n.expressions.append(music21.expressions.Fermata())
+                if genre_name == "MENUET" and n.quarterLength <= 0.5:
+                    n.articulations.append(music21.articulations.Staccato())
+                m.append(n)
+                notes_in_measure.append(n)
 
             self._pad_measure(m, m_data, meter_quarters)
 
@@ -244,6 +270,7 @@ class ScoreMixin:
                 elif measure_num == 16:
                     m.rightBarline = music21.bar.Repeat(direction='end')
 
+            m_data = self._fit_events(m_data, meter_quarters)
             for ev in m_data:
                 vel = {'ppp': 30, 'pp': 40, 'p': 50, 'mp': 64, 'mf': 80, 'f': 96, 'ff': 112}.get(ev.get('dynamic', 'mf'), 80)
                 

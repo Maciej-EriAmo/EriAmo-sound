@@ -11,7 +11,7 @@ Analizator Muzyczny EriAmo v5.9.1 [COMPATIBILITY FIX]
 - Mapowanie cech "etycznych" na Affections (Wzniosłość) i Improwizację (Porządek)
 """
 import numpy as np
-from amocore_v59 import AXES_LIST, EPHEMERAL_AXES, PERSISTENT_AXES
+from amocore_v59 import AXES_LIST, EPHEMERAL_AXES
 
 
 class MusicAnalyzer:
@@ -141,7 +141,16 @@ class MusicAnalyzer:
         recognized = []
         unknown = []
         
-        for f in features:
+        seen = set()
+        unique = []
+        for feature in features:
+            key = str(feature).upper().strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            unique.append(feature)
+
+        for f in unique:
             key = f.upper().strip()
             if key in self.COEFFICIENTS:
                 entry = self.COEFFICIENTS[key]
@@ -208,7 +217,9 @@ class MusicAnalyzer:
         else:
             info_val = entry[1]
             axis_name = AXES_LIST[entry[0]]
-        return {"exists": True, "name": key, "axis": axis_name, "value": info_val, "is_ephemeral": False}
+        axes = [AXES_LIST[item[0]] for item in entry] if isinstance(entry, list) else [axis_name]
+        ephemeral = any(axis in EPHEMERAL_AXES for axis in axes)
+        return {"exists": True, "name": key, "axis": axis_name, "value": info_val, "is_ephemeral": ephemeral}
 
     def list_all_features(self) -> dict:
         grouped = {axis: [] for axis in AXES_LIST}

@@ -334,26 +334,6 @@ class GenreMixin:
         melody, harmony = self._apply_learned_key(melody, harmony, style, 0)
         return {'melody': melody, 'harmony': harmony}
 
-    def _generate_simple_poly(self, genre_name: str) -> dict:
-        metrics = self._get_soul_metrics()
-        progression = [(48, 'maj'), (53, 'maj'), (55, 'maj'), (48, 'maj')] * 4
-        
-        # Skala C-dur (pentatonika + F + B)
-        scale = [60, 62, 64, 65, 67, 69, 71, 72]
-        
-        beats = 4.0
-        harmony = []
-        for root, ctype in progression:
-            chord_notes = self._build_chord_notes(root, ctype)
-            harmony.append([
-                {'type': 'chord', 'pitch': chord_notes, 'duration': beats, 'dynamic': 'mf'}
-            ])
-        melody = self._line_over(
-            progression, scale, beats, metrics, 0.0, 0, "mf",
-            cell=(1, 1, -1, 2, -1, 1, -1),
-        )
-        return {'melody': melody, 'harmony': harmony}
-
     def _generate_heavy_metal(self) -> dict:
         """Wolniejsze, niższe riffy niż power metal. Tonacja E."""
         metrics = self._get_soul_metrics()

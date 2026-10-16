@@ -6,6 +6,8 @@
 """Generatory menuetu: Mozart Würfelspiel i Joseph Riepel."""
 import random
 
+from dice_measures import DICE_MEASURES, events_from_measure
+
 
 class MenuetMixin:
     # ============= STYLE HISTORYCZNE MENUETÓW =============
@@ -35,9 +37,8 @@ class MenuetMixin:
                 'modular_phrases',    # Modularne frazy
                 'interchangeable'     # Wymienne takty
             ],
-            # TABLICA MOZARTA - uproszczona wersja (oryginał ma 176 taktów)
-            # Każdy wiersz = wynik rzutu (2-12), każda kolumna = numer taktu (1-8 dla części A, 1-8 dla B)
-            # Wartości to indeksy do DICE_MEASURES
+            # Tablica z wydania Rellstaba. Wiersz to rzut 2–12, kolumna to miejsce w menuetach.
+            # Liczba jest numerem jednego z 176 zapisanych taktów w dice_measures.
             'dice_table_A': [
                 # Rzut:  t1   t2   t3   t4   t5   t6   t7   t8
                 [96,  22,  141, 41,  105, 122, 11,  30],   # 2
@@ -234,6 +235,9 @@ class MenuetMixin:
         # === NOWE: TONACJA Z PAMIĘCI ===
         memory_style = metrics.get('memory_style', {})
         tonic, is_minor = self._resolve_tonic(tonic, memory_style)
+        raw_bass = style_config.get("characteristics", {}).get("bass_style")
+        self._menuet_is_minor = is_minor
+        self._menuet_bass_style = raw_bass if raw_bass in ("walking", "alberti", "stately") else None
         
         # Stopnie skali od toniki
         I = tonic
@@ -257,18 +261,15 @@ class MenuetMixin:
             # T-T-S-T-T-T-S = 0,2,4,5,7,9,11
             scale = [tonic + i for i in [0, 2, 4, 5, 7, 9, 11, 12, 14, 16, 17, 19, 21, 23, 24]]
         
-        # === CHROMATYKA z pamięci ===
-        chromatic_density = memory_style.get('chromatic_density', 0.0)
-        if chromatic_density > 0.15:  # Jeśli utwory uczące miały chromatykę
-            # Dodaj nuty chromatyczne do skali
-            chromatic_notes = []
-            for i in range(len(scale) - 1):
-                if scale[i + 1] - scale[i] > 1:
-                    chromatic_notes.append(scale[i] + 1)
-            scale = sorted(set(scale + chromatic_notes))
+        # Chromatykę dokłada sam motyw, na własnej skali. Kadencje zostają na skali diatonicznej.
+        if float(memory_style.get("chromatic_density", 0.0)) > 0.15:
+            memory_style = dict(memory_style)
+            memory_style["pitch_variance"] = max(float(memory_style.get("pitch_variance", 0.3)), 0.65)
+            metrics = dict(metrics)
+            metrics["memory_style"] = memory_style
         
         # Generuj motyw 2-taktowy z wybranym stylem
-        motif = self._riepel_generate_motif(tonic, scale, metrics, style_config)
+        motif = self._riepel_generate_motif(tonic, scale, metrics, style_config, is_minor=is_minor)
         
         melody, harmony = [], []
         
@@ -359,7 +360,8 @@ class MenuetMixin:
                 'form': 'Binary (A:||:B:||)',
                 'A_repeat': (0, 8),
                 'B_repeat': (8, 16),
-                'tonic': tonic
+                'tonic': tonic,
+                'is_minor': is_minor,
             },
             'style_info': style_config  # Informacje o użytym stylu
         }
@@ -386,8 +388,9 @@ class MenuetMixin:
         # Modulacja emocjonalna
         emotion_mod = emocje / 50  # -2 do +2
         
-        # Modulacja kreacji (więcej wariancji)
-        if kreacja > 60:
+        # Modulacja kreacji i tolerancji ryzyka (więcej wariancji rzutu, nie skoku melodii)
+        risk = float(metrics.get("risk_tolerance", 0.3))
+        if kreacja > 60 or risk >= 0.6:
             variance = random.randint(-2, 2)
         else:
             variance = random.randint(-1, 1)
@@ -401,16 +404,10 @@ class MenuetMixin:
         return max(2, min(12, result))  # Ogranicz do 2-12
     
     def _generate_menuet_mozart_dice(self, tonic: int = 60) -> dict:
-        """
-        Menuet wygenerowany metodą Mozarta Würfelspiel (K.516f).
-        
-        Zamiast algorytmicznego generowania, używamy tablicy taktów
-        i "rzutów kośćmi" sterowanych emocjami.
-        
-        To daje bardziej "mozartowski" rezultat - każdy takt jest 
-        stylistycznie spójny, a losowość daje różnorodność.
-        
-        NAPRAWIONE: Bas jest synchronizowany z melodią!
+        """Menuet z 176 taktów Würfelspiel (K.516f).
+
+        Rzut wybiera numer z tablicy. Obie ręce biorą zapisany takt
+        i przesuwają go z C-dur do wybranej toniki.
         """
         metrics = self._get_soul_metrics()
         memory_style = metrics.get('memory_style', {})
@@ -425,60 +422,28 @@ class MenuetMixin:
             # Fallback do Riepela jeśli brak tablic
             return self._generate_menuet_polyphonic(tonic, 'MOZART')
         
-        tonic, is_minor = self._resolve_tonic(tonic, memory_style)
-        
-        # Skala
-        if is_minor:
-            scale = [tonic + i for i in [0, 2, 3, 5, 7, 8, 10, 12, 14, 15, 17, 19, 20, 22, 24]]
-        else:
-            scale = [tonic + i for i in [0, 2, 4, 5, 7, 9, 11, 12, 14, 16, 17, 19, 21, 23, 24]]
-        
-        I = tonic
-        V = tonic + 7
-        IV = tonic + 5
+        tonic, _learned_minor = self._resolve_tonic(tonic, memory_style)
+        # 176 taktów jest durowych. Przesuwamy je z C do wybranej toniki.
+        shift = int(tonic) - 60
         
         melody = []
         harmony = []
         dice_results = []
+        measure_ids = []
         
-        # === CZĘŚĆ A: 8 taktów ===
-        for measure_idx in range(8):
-            # Rzut kośćmi (sterowany emocjami)
-            roll = self._emotion_dice_roll(metrics)
-            dice_results.append(roll)
-            
-            # Pobierz indeks taktu z tablicy (roll-2 bo tablica od 0, rzut od 2)
-            table_idx = roll - 2
-            if table_idx < len(table_A) and measure_idx < len(table_A[table_idx]):
-                measure_id = table_A[table_idx][measure_idx]
-            else:
-                measure_id = random.randint(1, 176)
-            
-            # Generuj takt na podstawie ID (uproszczone - generuj w stylu Mozarta)
-            measure_notes = self._generate_dice_measure(measure_id, scale, metrics, measure_idx, 'A')
-            melody.append(measure_notes)
-            
-            # === BAS ZSYNCHRONIZOWANY Z MELODIĄ ===
-            bass_measure = self._mozart_consonant_bass(measure_notes, tonic, measure_idx, 'A', is_minor)
-            harmony.append(bass_measure)
-        
-        # === CZĘŚĆ B: 8 taktów ===
-        for measure_idx in range(8):
-            roll = self._emotion_dice_roll(metrics)
-            dice_results.append(roll)
-            
-            table_idx = roll - 2
-            if table_idx < len(table_B) and measure_idx < len(table_B[table_idx]):
-                measure_id = table_B[table_idx][measure_idx]
-            else:
-                measure_id = random.randint(1, 176)
-            
-            measure_notes = self._generate_dice_measure(measure_id, scale, metrics, measure_idx, 'B')
-            melody.append(measure_notes)
-            
-            # === BAS ZSYNCHRONIZOWANY Z MELODIĄ ===
-            bass_measure = self._mozart_consonant_bass(measure_notes, tonic, measure_idx, 'B', is_minor)
-            harmony.append(bass_measure)
+        for table in (table_A, table_B):
+            for measure_idx in range(8):
+                roll = self._emotion_dice_roll(metrics)
+                dice_results.append(roll)
+                table_idx = roll - 2
+                if table_idx < len(table) and measure_idx < len(table[table_idx]):
+                    measure_id = table[table_idx][measure_idx]
+                else:
+                    measure_id = random.randint(1, 176)
+                measure_ids.append(measure_id)
+                right, left = events_from_measure(measure_id, shift)
+                melody.append(right)
+                harmony.append(left)
         
         return {
             'melody': melody,
@@ -488,7 +453,9 @@ class MenuetMixin:
                 'A_repeat': (0, 8),
                 'B_repeat': (8, 16),
                 'tonic': tonic,
-                'dice_results': dice_results  # Wyniki "rzutów"
+                'is_minor': False,
+                'dice_results': dice_results,
+                'measure_ids': measure_ids,
             },
             'style_info': {
                 'primary_master': 'MOZART_DICE',
@@ -498,185 +465,6 @@ class MenuetMixin:
             }
         }
     
-    def _mozart_consonant_bass(self, melody_notes: list, tonic: int, measure_idx: int, 
-                                section: str, is_minor: bool = False) -> list:
-        """
-        Generuje bas w stylu Mozarta, ZSYNCHRONIZOWANY z melodią.
-        
-        Zasady:
-        1. Bas gra nuty konsonansowe względem melodii (tercje, kwinty, oktawy)
-        2. Prosty rytm (głównie jedna nuta na takt lub bas Albertiego)
-        3. Harmonia zależy od pozycji w formie
-        """
-        bass_notes = []
-        
-        # Określ akord na podstawie pozycji w formie
-        # Część A: I-I-I-I-V-V-I-I (uproszczone)
-        # Część B: V-V-ii-V-I-IV-V-I
-        if section == 'A':
-            chord_progression = [0, 0, 0, 5, 7, 7, 0, 0]  # Względem toniki
-        else:  # B
-            chord_progression = [7, 7, 2, 7, 0, 5, 7, 0]
-        
-        chord_offset = chord_progression[measure_idx] if measure_idx < len(chord_progression) else 0
-        chord_root = tonic + chord_offset
-        
-        # Znajdź dominującą nutę melodii w tym takcie
-        if melody_notes:
-            melody_pitches = [n['pitch'] for n in melody_notes if n.get('type') == 'note']
-            if melody_pitches:
-                # Pierwsza nuta taktu jest najważniejsza
-                melody_first = melody_pitches[0]
-            else:
-                melody_first = tonic + 12  # Fallback
-        else:
-            melody_first = tonic + 12
-        
-        # === ZNAJDŹ KONSONANSOWY BAS ===
-        # Konsonanse: unison (0), tercja (3,4), kwinta (7), oktawa (12)
-        consonant_intervals = [0, 3, 4, 7, 8, 9, 12]  # Dodałem sekstę (8,9) też OK
-        
-        # Bazowy bas to korzeń akordu, ale przesuń o oktawę w dół
-        bass_pitch = chord_root - 12  # Oktawa niżej niż tonika
-        if bass_pitch < 36:  # Nie za nisko (C2)
-            bass_pitch = chord_root
-        
-        # Sprawdź czy bas jest konsonansowy z melodią
-        interval_to_melody = abs(melody_first - bass_pitch) % 12
-        
-        if interval_to_melody not in consonant_intervals:
-            # Szukaj najbliższego konsonansu
-            best_bass = bass_pitch
-            best_distance = 100
-            
-            for cons in consonant_intervals:
-                # Spróbuj nuty która tworzy konsonans z melodią
-                candidate = melody_first - cons
-                while candidate < 36:  # Nie za nisko
-                    candidate += 12
-                while candidate > 60:  # Nie za wysoko dla basu
-                    candidate -= 12
-                
-                # Preferuj nuty bliskie korzeniowi akordu
-                distance = abs(candidate % 12 - chord_root % 12)
-                if distance < best_distance:
-                    best_distance = distance
-                    best_bass = candidate
-            
-            bass_pitch = best_bass
-        
-        # === RYTM BASU (prosty, mozartowski) ===
-        # Wybór stylu: prosta nuta na takt lub bas Albertiego
-        if measure_idx in [3, 7, 11, 15]:  # Kadencje - prosta nuta
-            bass_notes.append({
-                'type': 'note', 
-                'pitch': bass_pitch, 
-                'duration': 3.0,  # Cały takt
-                'dynamic': 'mf'
-            })
-        elif random.random() < 0.6:  # 60% - prosty bas
-            bass_notes.append({
-                'type': 'note',
-                'pitch': bass_pitch,
-                'duration': 3.0,
-                'dynamic': 'mp'
-            })
-        else:  # 40% - bas Albertiego (rozkładany akord)
-            # Tercja i kwinta nad basem
-            third = bass_pitch + (3 if is_minor else 4)
-            fifth = bass_pitch + 7
-            
-            # Wzór Albertiego: bas-kwinta-tercja lub bas-tercja-kwinta
-            if random.random() < 0.5:
-                pattern = [bass_pitch, fifth, third]
-            else:
-                pattern = [bass_pitch, third, fifth]
-            
-            for i, p in enumerate(pattern):
-                bass_notes.append({
-                    'type': 'note',
-                    'pitch': p,
-                    'duration': 1.0,
-                    'dynamic': 'mp' if i > 0 else 'mf'
-                })
-        
-        return bass_notes
-    
-    def _generate_dice_measure(self, measure_id: int, scale: list, metrics: dict, 
-                               measure_idx: int, section: str) -> list:
-        """
-        Generuje pojedynczy takt w stylu mozartowskiej gry w kości.
-        
-        measure_id determinuje "charakter" taktu (w oryginale to były zapisane takty).
-        My generujemy je algorytmicznie, ale measure_id wpływa na wybór wzorca.
-        """
-        memory_style = metrics.get('memory_style', {})
-
-        # measure_id wpływa na charakter taktu
-        pattern_type = measure_id % 8  # 8 typów wzorców
-        
-        # Typowe rytmy mozartowskie dla menueta
-        rhythms = [
-            [1.0, 1.0, 1.0],           # 0: równe ćwierćnuty
-            [2.0, 1.0],                 # 1: półnuta + ćwierćnuta
-            [1.0, 2.0],                 # 2: ćwierćnuta + półnuta
-            [1.0, 0.5, 0.5, 1.0],       # 3: ćwierć + dwie ósemki + ćwierć
-            [0.5, 0.5, 0.5, 0.5, 1.0],  # 4: cztery ósemki + ćwierć
-            [1.0, 0.5, 0.5, 0.5, 0.5],  # 5: ćwierć + cztery ósemki
-            [1.5, 0.5, 1.0],            # 6: punktowana (bardziej händlowska)
-            [0.5, 0.5, 1.0, 1.0],       # 7: dwie ósemki + dwie ćwierćnuty
-        ]
-        
-        rhythm = rhythms[pattern_type]
-        cells = (
-            (1, 1, -1),
-            (1, -1, 1),
-            (-1, 1, 1),
-            (1, 2, -1),
-            (1, 1, -1, 1),
-            (-1, 1, -1),
-            (1, -1, 2),
-            (1, 0, -1),
-        )
-        cell = cells[pattern_type]
-        # Kadencje idą po stopniach do dominanty albo toniki, bez skoku na początek taktu.
-        if section == 'A' and measure_idx == 3:
-            cadence_target = 4
-        elif section == 'A' and measure_idx == 7:
-            cadence_target = 0
-        elif section == 'B' and measure_idx == 0:
-            cadence_target = 4
-        elif section == 'B' and measure_idx == 7:
-            cadence_target = 0
-        else:
-            cadence_target = None
-
-        cursor = getattr(self, "_menuet_cursor", None)
-        if cursor is None:
-            current_idx = random.choice([0, 2, 4])
-        else:
-            current_idx = max(0, min(len(scale) - 1, int(cursor)))
-
-        notes = []
-        for i, dur in enumerate(rhythm):
-            dyn = 'mf' if i == 0 else 'mp'
-            if cadence_target is not None and current_idx != cadence_target:
-                current_idx += 1 if current_idx < cadence_target else -1
-            current_idx = max(0, min(len(scale) - 1, current_idx))
-            notes.append({
-                'type': 'note',
-                'pitch': scale[current_idx],
-                'duration': dur,
-                'dynamic': dyn,
-            })
-            if cadence_target is None:
-                step = cell[i % len(cell)]
-                if memory_style.get('leap_ratio', 0.3) > 0.5 and random.random() < 0.3:
-                    step += 1 if step >= 0 else -1
-                current_idx = max(0, min(len(scale) - 1, current_idx + step))
-
-        self._menuet_cursor = current_idx
-        return notes
     
     def _select_menuet_style(self, metrics: dict, forced_style: str = None) -> dict:
         """
@@ -753,15 +541,16 @@ class MenuetMixin:
             
             # Dodaj wzorce z secondary
             for key, patterns in secondary_style['typical_patterns'].items():
-                if key in config['patterns']:
-                    config['patterns'][key] = config['patterns'][key] + patterns
+                current = config['patterns'].get(key)
+                if isinstance(current, list) and isinstance(patterns, list):
+                    config['patterns'][key] = current + patterns
             
             # Dodaj signature moves z secondary
             config['signature_moves'].extend(secondary_style['signature_moves'])
         
         return config
 
-    def _riepel_generate_motif(self, tonic: int, scale: list, metrics: dict, style_config: dict = None) -> dict:
+    def _riepel_generate_motif(self, tonic: int, scale: list, metrics: dict, style_config: dict = None, is_minor: bool = False) -> dict:
         """
         Generuje 2-taktowy motyw z uwzględnieniem stylu historycznego.
         
@@ -812,51 +601,49 @@ class MenuetMixin:
             signatures = []
             master = 'RIEPEL'
         
-        # Znajdź indeks toniki w skali
-        tonic_idx = 0
-        for i, p in enumerate(scale):
-            if p % 12 == tonic % 12:
-                tonic_idx = i
-                break
-        
-        # === ROZSZERZONA PULA DŹWIĘKÓW (na podstawie pamięci) ===
-        # Bazowe dźwięki akordowe toniki (I, III, V, I')
-        chord_indices = [tonic_idx, tonic_idx + 2, tonic_idx + 4, tonic_idx + 7]
-        chord_indices = [i for i in chord_indices if i < len(scale)]
-        
         # PAMIĘĆ: Rozszerz pulę dźwięków jeśli system nauczył się różnorodności
         pitch_variance = memory_style.get('pitch_variance', 0.3)
         dominant_pitch = memory_style.get('dominant_pitch_class', 0.0)
-        
-        # Dostępne dźwięki (rozszerzane przez pamięć)
+
+        # Jedna skala i jeden zestaw indeksów. Przy wysokiej wariancji skala jest chromatyczna,
+        # a dźwięki akordu szukamy po klasie wysokości.
+        working_scale = list(scale)
         if pitch_variance > 0.6:
-            # Wysoka wariancja - używaj CAŁEJ skali + chromatyki
-            available_indices = list(range(len(scale)))
-            # Dodaj nuty chromatyczne między stopniami
-            chromatic_additions = []
-            for idx in available_indices[:-1]:
-                if idx + 1 < len(scale) and scale[idx + 1] - scale[idx] > 1:
-                    chromatic_additions.append(scale[idx] + 1)
-            # Rozszerz skalę
-            extended_scale = sorted(set(scale + chromatic_additions))
-        elif pitch_variance > 0.4:
-            # Średnia wariancja - cała skala diatoniczna
-            available_indices = list(range(len(scale)))
-            extended_scale = scale
+            chromatic_additions = [
+                scale[idx] + 1
+                for idx in range(len(scale) - 1)
+                if scale[idx + 1] - scale[idx] > 1
+            ]
+            working_scale = sorted(set(list(scale) + chromatic_additions))
+
+        def pitch_index(offset, start=0):
+            wanted = (int(tonic) + int(offset)) % 12
+            for index in range(max(0, start), len(working_scale)):
+                if working_scale[index] % 12 == wanted:
+                    return index
+            for index, pitch in enumerate(working_scale):
+                if pitch % 12 == wanted:
+                    return index
+            return 0
+
+        third_offset = 3 if is_minor else 4
+        tonic_idx = pitch_index(0)
+        chord_indices = []
+        for offset in (0, third_offset, 7, 12):
+            found = pitch_index(offset)
+            if found not in chord_indices:
+                chord_indices.append(found)
+
+        if pitch_variance > 0.4:
+            available_indices = list(range(len(working_scale)))
         else:
-            # Niska wariancja - głównie akordy
-            available_indices = chord_indices
-            extended_scale = scale
-        
-        # PAMIĘĆ: Preferuj pewne stopnie skali na podstawie tego czego się nauczył
-        # dominant_pitch_class jest znormalizowany 0-1 (0=C, 0.5=F#, 1.0=B)
-        preferred_pitch_class = int(dominant_pitch * 11)  # 0-11
-        
-        # Znajdź indeksy w skali które odpowiadają preferowanej klasie
-        preferred_indices = []
-        for i, p in enumerate(extended_scale if pitch_variance > 0.4 else scale):
-            if p % 12 == preferred_pitch_class:
-                preferred_indices.append(i)
+            available_indices = list(chord_indices)
+
+        preferred_pitch_class = int(dominant_pitch * 11) % 12
+        preferred_indices = [
+            index for index, pitch in enumerate(working_scale)
+            if pitch % 12 == preferred_pitch_class
+        ]
         
         # Wagi dla wyboru dźwięków początkowych
         # Jeśli pamięć preferuje inną nutę niż tonika, zwiększ jej szansę
@@ -934,6 +721,15 @@ class MenuetMixin:
         if master == 'HANDEL' and char.get('dotted_rhythm', 0) > 0.5:
             dotted_rhythms = [[1.5, 0.5, 1.0], [1.0, 1.5, 0.5], [1.5, 1.5]]
             rhythm_patterns = dotted_rhythms + rhythm_patterns
+
+        if mem_syncopation > 0.45:
+            syncopated = [item for item in rhythm_patterns if any(float(d) < 1.0 for d in item)]
+            if syncopated:
+                rhythm_patterns = syncopated
+        elif mem_regularity > 0.6:
+            regular = [item for item in rhythm_patterns if all(float(d) >= 1.0 for d in item)]
+            if regular:
+                rhythm_patterns = regular
         
         rhythm1 = random.choice(rhythm_patterns)
         rhythm2 = random.choice(rhythm_patterns)
@@ -943,26 +739,20 @@ class MenuetMixin:
         
         # Wybierz początkową nutę (teraz z uwzględnieniem pamięci!)
         if pitch_variance > 0.4 and start_weights:
-            # Użyj wag z pamięci
             weighted_options = []
             for idx, weight in start_weights.items():
-                if idx < len(extended_scale if pitch_variance > 0.4 else scale):
+                if 0 <= idx < len(working_scale):
                     weighted_options.extend([idx] * int(weight * 2))
-            if weighted_options:
-                start_options = weighted_options
-            else:
-                start_options = [tonic_idx, tonic_idx + 2, tonic_idx + 4]
+            start_options = weighted_options or list(chord_indices[:3])
         else:
-            start_options = [tonic_idx, tonic_idx + 2, tonic_idx + 4]
+            start_options = list(chord_indices[:3]) or [tonic_idx]
         
-        # HÄNDEL: preferuj skoki (fanfarowe początki)
+        # HÄNDEL: preferuj skoki (fanfarowe początki) — I, V, I'
         if master == 'HANDEL' and 'fanfare_leaps' in signatures:
-            start_options = [tonic_idx, tonic_idx + 4, tonic_idx + 7]  # I, V, I'
+            start_options = [pitch_index(0), pitch_index(7), pitch_index(12)]
         
-        # Użyj rozszerzonej skali jeśli wysoka wariancja
-        working_scale = extended_scale if pitch_variance > 0.4 else scale
-        
-        start_idx = random.choice([i for i in start_options if i < len(working_scale)])
+        legal_starts = [i for i in start_options if 0 <= i < len(working_scale)]
+        start_idx = random.choice(legal_starts or [tonic_idx])
         current_idx = start_idx
         
         for i, dur in enumerate(rhythm1):
@@ -974,13 +764,17 @@ class MenuetMixin:
             
             pitch = working_scale[min(current_idx, len(working_scale) - 1)]
             
-            # MOZART: przednutki (grace notes)
-            if master == 'MOZART' and 'grace_notes' in signatures and i == 0 and random.random() < 0.3:
-                # Dodaj przednutkę (nie zmienia struktury, tylko atrybut)
-                grace_pitch = working_scale[min(current_idx + 1, len(working_scale) - 1)]
-                m1.append({'type': 'note', 'pitch': grace_pitch, 'duration': 0.125, 'dynamic': 'mp', 'grace': True})
+            # MOZART: przednutka zabiera czas nucie głównej, żeby takt został 3/4.
+            sounded = dur
+            grace_chance = float(char.get('ornament_density', ornament_density))
+            if master == 'MOZART' and 'grace_notes' in signatures and i == 0 and random.random() < grace_chance:
+                stolen = 0.125
+                if dur - stolen >= 0.25:
+                    grace_pitch = working_scale[min(current_idx + 1, len(working_scale) - 1)]
+                    m1.append({'type': 'note', 'pitch': grace_pitch, 'duration': stolen, 'dynamic': 'mp', 'grace': True})
+                    sounded = dur - stolen
             
-            m1.append({'type': 'note', 'pitch': pitch, 'duration': dur, 'dynamic': dyn})
+            m1.append({'type': 'note', 'pitch': pitch, 'duration': sounded, 'dynamic': dyn})
             
             # Ruch melodyczny zależny od typu motywu
             if motif_type == 'ascending':
@@ -1025,12 +819,12 @@ class MenuetMixin:
         
         # Punkt docelowy (zależny od pamięci!)
         if pitch_variance > 0.5 and preferred_indices:
-            # Preferuj zakończenie na nucie z pamięci
-            target_options = preferred_indices + [tonic_idx + 2, tonic_idx + 4]
+            target_options = preferred_indices + [pitch_index(third_offset), pitch_index(7)]
         else:
-            target_options = [tonic_idx + 2, tonic_idx + 4, tonic_idx]
+            target_options = [pitch_index(third_offset), pitch_index(7), tonic_idx]
         
-        target_idx = random.choice([i for i in target_options if i < len(working_scale)])
+        legal_targets = [i for i in target_options if 0 <= i < len(working_scale)]
+        target_idx = random.choice(legal_targets or [tonic_idx])
         
         for i, dur in enumerate(rhythm2):
             dyn = 'mf' if i == 0 else 'mp'
@@ -1047,6 +841,8 @@ class MenuetMixin:
             m2.append({'type': 'note', 'pitch': pitch, 'duration': dur, 'dynamic': dyn})
         
         melody_measures.append(m2)
+        self._fit_bar_durations(m1, 3.0)
+        self._fit_bar_durations(m2, 3.0)
         
         return {
             'melody': melody_measures, 
@@ -1054,6 +850,32 @@ class MenuetMixin:
             'motif_type': motif_type,
             'style': master
         }
+
+    def _fit_bar_durations(self, events: list, quarters: float = 3.0) -> None:
+        """Dopasowuje sumę wartości do taktu. Nadmiar ucina od końca."""
+        if not events:
+            return
+        total = sum(float(event.get("duration", 0)) for event in events)
+        extra = total - quarters
+        if extra > 1e-6:
+            for event in reversed(events):
+                duration = float(event.get("duration", 0))
+                room = duration - 0.25
+                if room <= 1e-9:
+                    continue
+                cut = min(room, extra)
+                event["duration"] = duration - cut
+                extra -= cut
+                if extra <= 1e-6:
+                    break
+            if extra > 1e-6:
+                total = sum(float(event.get("duration", 0)) for event in events)
+                if total > quarters and total > 0:
+                    factor = quarters / total
+                    for event in events:
+                        event["duration"] = float(event.get("duration", 0)) * factor
+        elif extra < -1e-6:
+            events[-1]["duration"] = float(events[-1].get("duration", 0)) - extra
 
     def _riepel_generate_answer(self, motif: dict, scale: list, metrics: dict) -> dict:
         """
@@ -1097,11 +919,9 @@ class MenuetMixin:
                         new_idx = max(0, idx + transpose_interval)
                         
                 elif technique == 'rhythmic_variation':
-                    # Zachowaj wysokość, zmień rytm (obsługiwane przez zmianę duration)
                     new_idx = max(0, idx + random.choice([-1, 0, 0]))
-                    # Losowa zmiana rytmu
                     if random.random() > 0.5:
-                        new_note['duration'] = max(0.5, note['duration'] * random.choice([0.5, 1.0, 1.5]))
+                        new_note['duration'] = note['duration'] * random.choice([0.5, 1.0, 1.5])
                         
                 else:  # sequence
                     # Sekwencja - powtórzenie wzoru na innej wysokości
@@ -1111,18 +931,37 @@ class MenuetMixin:
                 new_note['pitch'] = scale[min(new_idx, len(scale) - 1)]
                 new_measure.append(new_note)
             
-            # Normalizuj długości do 3.0 (takt 3/4)
-            total_dur = sum(n['duration'] for n in new_measure)
-            if total_dur != 3.0 and new_measure:
-                # Dostosuj ostatnią nutę
-                diff = 3.0 - sum(n['duration'] for n in new_measure[:-1])
-                new_measure[-1]['duration'] = max(0.5, diff)
-            
+            self._fit_bar_durations(new_measure, 3.0)
             melody_measures.append(new_measure)
         
         return {'melody': melody_measures}
     
-    def _riepel_bass_pattern(self, root: int, function: str, measures: int) -> list:
+    def _styled_bass_bar(self, bass: int, third: int, style: str) -> list:
+        """Bas walking, Albertiego albo dostojny. Suma taktu zostaje 3.0."""
+        fifth = bass + 7
+        second = bass + 2
+        if style == "walking":
+            return [
+                {'type': 'note', 'pitch': bass, 'duration': 1.0, 'dynamic': 'mf'},
+                {'type': 'note', 'pitch': second, 'duration': 1.0, 'dynamic': 'mp'},
+                {'type': 'note', 'pitch': bass + third, 'duration': 1.0, 'dynamic': 'mp'},
+            ]
+        if style == "alberti":
+            return [
+                {'type': 'note', 'pitch': bass, 'duration': 1.0, 'dynamic': 'mf'},
+                {'type': 'note', 'pitch': fifth, 'duration': 1.0, 'dynamic': 'mp'},
+                {'type': 'note', 'pitch': bass + third, 'duration': 1.0, 'dynamic': 'mp'},
+            ]
+        if style == "stately":
+            return [
+                {'type': 'note', 'pitch': bass, 'duration': 1.5, 'dynamic': 'mf'},
+                {'type': 'note', 'pitch': bass, 'duration': 0.5, 'dynamic': 'mp'},
+                {'type': 'note', 'pitch': fifth, 'duration': 1.0, 'dynamic': 'mp'},
+            ]
+        return []
+
+    def _riepel_bass_pattern(self, root: int, function: str, measures: int,
+                             is_minor: bool = None, bass_style: str = None) -> list:
         """
         Generuje wzorzec basowy w stylu galant.
         Bas krokowy, wspierający kadencje, bez dominacji.
@@ -1140,19 +979,24 @@ class MenuetMixin:
         """
         patterns = []
         bass = root - 12  # Oktawa niżej
+        if is_minor is None:
+            is_minor = bool(getattr(self, "_menuet_is_minor", False))
+        if bass_style is None:
+            bass_style = getattr(self, "_menuet_bass_style", None)
         
         for _ in range(measures):
             m = []
+            third = 3 if (is_minor and function in ("I", "IV")) or function in ("ii", "vi") else 4
             
             if function == 'I':
-                # I-V-I lub I-III-V (styl galant)
+                # I-V-I lub I-III-V (styl galant). W mollu tercja I jest mała.
                 m.append({'type': 'note', 'pitch': bass, 'duration': 1.0, 'dynamic': 'mf'})
-                m.append({'type': 'chord', 'pitch': [bass + 4, bass + 7], 'duration': 1.0, 'dynamic': 'mp'})
-                m.append({'type': 'chord', 'pitch': [bass + 4, bass + 7], 'duration': 1.0, 'dynamic': 'p'})
+                m.append({'type': 'chord', 'pitch': [bass + third, bass + 7], 'duration': 1.0, 'dynamic': 'mp'})
+                m.append({'type': 'chord', 'pitch': [bass + third, bass + 7], 'duration': 1.0, 'dynamic': 'p'})
                 
             elif function == 'IV':
                 m.append({'type': 'note', 'pitch': bass, 'duration': 1.0, 'dynamic': 'mf'})
-                m.append({'type': 'chord', 'pitch': [bass + 4, bass + 7], 'duration': 2.0, 'dynamic': 'mp'})
+                m.append({'type': 'chord', 'pitch': [bass + third, bass + 7], 'duration': 2.0, 'dynamic': 'mp'})
                 
             elif function == 'V':
                 m.append({'type': 'note', 'pitch': bass, 'duration': 1.0, 'dynamic': 'mf'})
@@ -1209,6 +1053,11 @@ class MenuetMixin:
                 # Domyślny wzorzec
                 m.append({'type': 'note', 'pitch': bass, 'duration': 1.0, 'dynamic': 'mf'})
                 m.append({'type': 'chord', 'pitch': [bass + 4, bass + 7], 'duration': 2.0, 'dynamic': 'mp'})
+
+            if bass_style in ("walking", "alberti", "stately") and function not in ("V_HC", "I_FINAL", "I_CAD"):
+                styled = self._styled_bass_bar(bass, third, bass_style)
+                if styled:
+                    m = styled
             
             patterns.append(m)
         
@@ -1431,11 +1280,26 @@ class MenuetMixin:
             new_measure = []
             for note in orig_measure:
                 new_note = note.copy()
-                # Możliwa drobna wariacja
-                if random.random() > 0.7 and metrics['kreacja'] > 20:
-                    # Ozdobnik
-                    new_note['duration'] = max(0.5, note['duration'] - 0.5)
-                new_measure.append(new_note)
+                if (
+                    random.random() > 0.7
+                    and metrics.get('kreacja', 0) > 20
+                    and float(note.get('duration', 0)) >= 1.0
+                ):
+                    stolen = 0.5
+                    new_note['duration'] = float(note['duration']) - stolen
+                    new_measure.append(new_note)
+                    try:
+                        idx = scale.index(note['pitch'])
+                    except ValueError:
+                        idx = min(range(len(scale)), key=lambda i: abs(scale[i] - note['pitch']))
+                    ornament = note.copy()
+                    ornament['pitch'] = scale[min(len(scale) - 1, idx + 1)]
+                    ornament['duration'] = stolen
+                    ornament['dynamic'] = 'mp'
+                    new_measure.append(ornament)
+                else:
+                    new_measure.append(new_note)
+            self._fit_bar_durations(new_measure, 3.0)
             melody_measures.append(new_measure)
         
         return {'melody': melody_measures}

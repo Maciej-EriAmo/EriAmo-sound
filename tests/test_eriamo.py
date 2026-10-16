@@ -150,6 +150,29 @@ class DiskTests(unittest.TestCase):
         memory = amocore_v59.get_music_memory()
         self.assertGreaterEqual(len(memory.H_log), 1)
 
+    def test_external_score_teaches_note_memory(self):
+        import queue
+
+        from main_gui_v59 import EriAmoBrain
+
+        session = EriAmoSession()
+        responses = queue.Queue()
+        brain = EriAmoBrain(session, queue.Queue(), responses)
+        path = self._write_pitches(self._g_major_line(), "external.mid")
+        brain._handle_learn_file({"paths": [path]})
+        learned = []
+        while not responses.empty():
+            learned.append(responses.get_nowait())
+        self.assertTrue(any(item["status"] == "LOG" and "G dur" in item["msg"] for item in learned))
+        style = amocore_v59.get_music_memory().get_blended_style()
+        self.assertEqual(int(round(style["key_tonic"] * 11)) % 12, 7)
+
+        brain._handle_learn_file({"paths": [os.path.join(self._tmp.name, "brak.mid")]})
+        missed = []
+        while not responses.empty():
+            missed.append(responses.get_nowait())
+        self.assertTrue(any(item["status"] == "ERROR" for item in missed))
+
     def test_waltz_meter_and_menuet_form(self):
         import music21
 
@@ -525,6 +548,18 @@ class DiskTests(unittest.TestCase):
 
 
 class LearningTests(unittest.TestCase):
+    def test_windows_score_path_survives_the_command_split(self):
+        from main_v59 import command_path, split_command
+
+        parts = split_command(r"!file C:\Users\eriamo\score.mid")
+        self.assertEqual(command_path(parts), r"C:\Users\eriamo\score.mid")
+        spaced = split_command(r"!file C:\My Music\sonata.mid")
+        self.assertEqual(command_path(spaced), r"C:\My Music\sonata.mid")
+        quoted = split_command(r'!teach "Sonata C" MENUET KLASYCYZM')
+        self.assertEqual(quoted, ["!teach", "Sonata C", "MENUET", "KLASYCYZM"])
+        with self.assertRaises(ValueError):
+            split_command('!teach "otwarte')
+
     def test_style_words_match_whole_words(self):
         from data_loader_v59 import ExternalKnowledgeLoader
         loader = ExternalKnowledgeLoader()
@@ -725,23 +760,96 @@ class LearningTests(unittest.TestCase):
         self.assertLess(answer[0], opening[0])
         self.assertAlmostEqual(sum(float(ev["duration"]) for ev in melody[0]), 4.0, places=3)
 
-    def test_menuet_dice_line_does_not_jump_between_bars(self):
+    def test_menuet_dice_uses_the_176_written_bars(self):
         import random
 
+        from composer_menuet import MenuetMixin
+        from dice_measures import DICE_MEASURES, events_from_measure
+
+        self.assertEqual(sorted(DICE_MEASURES), list(range(1, 177)))
+        for measure_id, (right, left) in DICE_MEASURES.items():
+            for voice in (right, left):
+                total = sum(float(duration) for _pitches, duration in voice)
+                self.assertAlmostEqual(total, 3.0, places=6, msg=measure_id)
+            for pitches, _duration in right + left:
+                if pitches is None:
+                    continue
+                for pitch in pitches:
+                    self.assertGreaterEqual(pitch, 0)
+                    self.assertLessEqual(pitch, 127)
+        self.assertEqual(
+            DICE_MEASURES[1],
+            (
+                (((77,), 1.0), ((74,), 1.0), ((79,), 1.0)),
+                (((53,), 1.0), ((50,), 1.0), ((55,), 1.0)),
+            ),
+        )
+        self.assertEqual(
+            DICE_MEASURES[2],
+            (
+                (((69,), 0.5), ((66,), 0.5), ((67,), 0.5), ((71,), 0.5), ((79,), 1.0)),
+                (((47, 55), 2.0), (None, 1.0)),
+            ),
+        )
+        self.assertEqual(DICE_MEASURES[5][0][0], ((67, 71, 74, 79), 2.0))
+        self.assertEqual(
+            DICE_MEASURES[15],
+            (
+                (((76,), 1.0), ((79,), 0.5), ((76,), 0.5), ((72,), 1.0)),
+                (((48, 55), 2.0), ((48, 52), 1.0)),
+            ),
+        )
+
+        tables = MenuetMixin.MENUET_MASTERS["MOZART_DICE"]
+        numbered = []
+        for table in (tables["dice_table_A"], tables["dice_table_B"]):
+            for row in table:
+                numbered.extend(row)
+        self.assertEqual(sorted(numbered), list(range(1, 177)))
+
+        previous_home = os.environ.get("ERIAMO_HOME")
+        folder = tempfile.TemporaryDirectory()
+        self.addCleanup(folder.cleanup)
+        amocore_v59.shutdown_music_memory()
+        amocore_v59._music_memory = None
+        os.environ["ERIAMO_HOME"] = folder.name
+
+        def restore_home():
+            amocore_v59.shutdown_music_memory()
+            amocore_v59._music_memory = None
+            if previous_home is None:
+                os.environ.pop("ERIAMO_HOME", None)
+            else:
+                os.environ["ERIAMO_HOME"] = previous_home
+
+        self.addCleanup(restore_home)
+        session = EriAmoSession()
         random.seed(2)
-        data = EriAmoSession().composer._generate_menuet_mozart_dice()
-        melody = data["melody"]
-        self.assertEqual(len(melody), 16)
-        previous = None
-        for bar in melody:
-            self.assertAlmostEqual(sum(float(ev["duration"]) for ev in bar), 3.0, places=3)
-            pitches = [ev["pitch"] for ev in bar if ev.get("type") == "note"]
-            self.assertGreater(len(pitches), 0)
-            for left, right in zip(pitches, pitches[1:]):
-                self.assertLessEqual(abs(right - left), 5)
-            if previous is not None:
-                self.assertLessEqual(abs(pitches[0] - previous), 7)
-            previous = pitches[-1]
+        plain = session.composer._generate_menuet_mozart_dice()
+        random.seed(2)
+        shifted = session.composer._generate_menuet_mozart_dice(67)
+
+        self.assertFalse(plain["structure"]["is_minor"])
+        self.assertFalse(shifted["structure"]["is_minor"])
+        self.assertEqual(shifted["structure"]["tonic"], 67)
+        self.assertEqual(shifted["structure"]["measure_ids"], plain["structure"]["measure_ids"])
+        rolls = plain["structure"]["dice_results"]
+        measure_ids = plain["structure"]["measure_ids"]
+        self.assertEqual(len(plain["melody"]), 16)
+        self.assertEqual(len(rolls), 16)
+        for index, (roll, measure_id) in enumerate(zip(rolls, measure_ids)):
+            table = tables["dice_table_A"] if index < 8 else tables["dice_table_B"]
+            self.assertEqual(measure_id, table[roll - 2][index % 8])
+            right, left = events_from_measure(measure_id, 0)
+            self.assertEqual(plain["melody"][index], right)
+            self.assertEqual(plain["harmony"][index], left)
+            shifted_right, shifted_left = events_from_measure(measure_id, 7)
+            self.assertEqual(shifted["melody"][index], shifted_right)
+            self.assertEqual(shifted["harmony"][index], shifted_left)
+            for voice in (right, left):
+                self.assertAlmostEqual(
+                    sum(float(event["duration"]) for event in voice), 3.0, places=3,
+                )
 
     def test_rock_and_roll_tempo_is_allegro_moderato(self):
         from composer_score import ScoreMixin

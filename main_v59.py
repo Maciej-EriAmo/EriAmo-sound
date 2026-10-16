@@ -13,9 +13,12 @@ EriAmo v5.9 - Główny Interfejs CLI (UPDATE)
 import shlex
 
 from amocore_v59 import AXES_LIST, EPHEMERAL_AXES, under_home
-from genre_definitions import GENRE_DEFINITIONS, list_genres
+
+_PATH_MARK = "\ue000"
+from genre_definitions import get_genre_info, list_genres
 from instruments import list_instrument_names
 from session import EriAmoSession
+from soul_composer_v59 import SoulComposerV59
 
 def print_banner():
     print("\033[96m")
@@ -40,6 +43,10 @@ def print_exit_summary(core):
         marker = "🔻" if axis in EPHEMERAL_AXES else "💎"
         print(f"  {marker} {axis.capitalize():12}: {vec[i]:+.2f}")
     print("-"*40)
+    print(f"  Cykle wygaszania: {decay_info['cycles_applied']}")
+    print(f"  Ostatnie wygaszenie: {decay_info['last_decay']}")
+    print(f"  Emocje (🔻): {decay_info['current_emotions']:+.2f}")
+    print(f"  Affections (💎): {decay_info['current_affections']:+.2f}")
     final_hash = core.compute_integrity_hash()
     print(f"🔐 SOULGUARD HASH: {final_hash}")
     print("="*60 + "\n")
@@ -48,16 +55,24 @@ def print_help():
     print("\n" + "="*70)
     print("📖 POMOC ERIAMO v5.9")
     print("="*70)
-    print("\n🎵 KOMPOZYCJA (NOWOŚĆ!):")
-    print("  !compose GATUNEK [INSTRUMENT] - Komponuj z wyborem barwy")
-    print("     np. !compose BLUES SAX")
-    print("     np. !compose MENUET DIST_GUITAR")
+    print("\n🎵 KOMPOZYCJA:")
+    print("  !compose GATUNEK [INSTRUMENT] [TONIKA]")
+    print("     np. !compose BLUES DIST_GUITAR")
+    print("     np. !compose MENUET G")
+    print("     np. !compose MENUET RIEPEL")
+    print("     np. !compose MENUET DIST_GUITAR RIEPEL:G")
     names = ", ".join(list_instrument_names())
     print(f"     Instrumenty: {names}")
-    print("  !genres                      - Lista gatunków")
+    tonics = ", ".join(SoulComposerV59.TONIC_MAP)
+    print(f"     Toniki: {tonics}, RIEPEL, RIEPEL:G")
+    generated = ", ".join(sorted(SoulComposerV59.GENERATED_GENRES))
+    print(f"     Z generatorem: {generated}")
+    print("  !genres                      - Katalog i oznaczenie generatora")
+    print("  !compositions                - Zapisane MIDI")
     
     print("\n🎓 NAUKA I ANALIZA:")
     print("  !teach \"Tytuł\" CECHY          - Trwałe uczenie")
+    print("  !simulate \"Tytuł\" CECHY       - Próba bez pełnego wpływu (0.1x)")
     print("  !web \"Artysta\" \"Utwór\"        - Nauka z MusicBrainz")
     print("  !file ŚCIEŻKA                 - Analiza pliku muzycznego") 
     print("\n⏱️ WYGASZANIE:")
@@ -69,8 +84,84 @@ def print_help():
     print("  !play ŚCIEŻKA                - Wskazany plik MIDI")
     print("  !stop                        - Zatrzymaj odtwarzanie")
     print("\n🔍 INNE:")
-    print("  !report, !trajectory, !status, !compare")
+    print("  !report, !trajectory, !timeline, !emotions, !events, !status, !compare")
     print("="*70 + "\n")
+
+
+def _parse_compose_tail(tokens):
+    """Rozdziela instrument i tonikę. RIEPEL oraz nazwa z TONIC_MAP to tonika."""
+    tonic_names = set(SoulComposerV59.TONIC_MAP)
+    instrument = None
+    riepel = False
+    pitch = None
+    for token in tokens:
+        upper = token.upper()
+        if upper == "RIEPEL":
+            riepel = True
+            continue
+        if upper.startswith("RIEPEL:"):
+            riepel = True
+            key = upper.split(":", 1)[1]
+            if key:
+                pitch = key
+            continue
+        if upper in tonic_names:
+            pitch = upper
+            continue
+        if instrument is None:
+            instrument = token
+    if riepel and pitch:
+        tonic = f"RIEPEL:{pitch}"
+    elif riepel:
+        tonic = "RIEPEL"
+    else:
+        tonic = pitch
+    return instrument, tonic
+
+def split_command(raw: str) -> list[str]:
+    """Dzieli komendę. Ukośnik w ścieżce Windows zostaje ukośnikiem."""
+    protected = []
+    quote = None
+    index = 0
+    while index < len(raw):
+        char = raw[index]
+        if quote is None:
+            if char in "\"'":
+                quote = char
+            elif char == "\\":
+                protected.append(_PATH_MARK)
+                index += 1
+                continue
+            protected.append(char)
+        elif quote == "'":
+            if char == "'":
+                quote = None
+            protected.append(char)
+        else:
+            if char == "\\" and index + 1 < len(raw) and raw[index + 1] in "\\\"":
+                protected.append(char)
+                protected.append(raw[index + 1])
+                index += 2
+                continue
+            if char == "\\":
+                protected.append(_PATH_MARK)
+                index += 1
+                continue
+            if char == '"':
+                quote = None
+            protected.append(char)
+        index += 1
+    parts = shlex.split("".join(protected))
+    return [part.replace(_PATH_MARK, "\\") for part in parts]
+
+
+def command_path(parts: list) -> str | None:
+    """Ścieżka złożona ze wszystkich słów po komendzie."""
+    if len(parts) < 2:
+        return None
+    text = " ".join(parts[1:]).strip()
+    return text or None
+
 
 def _announce_windows_midi(paths: dict) -> None:
     """Gra zapisane MIDI, gdy nie powstał WAV."""
@@ -123,7 +214,7 @@ def _command_loop(session, core):
                 print_help()
                 continue
             
-            try: parts = shlex.split(raw)
+            try: parts = split_command(raw)
             except ValueError:
                 print("❌ Błąd: Niezamknięty cudzysłów"); continue
             
@@ -132,18 +223,23 @@ def _command_loop(session, core):
             # ========== KOMPOZYCJA (ZMODYFIKOWANA) ==========
             if cmd == "!compose":
                 if len(parts) < 2:
-                    print("❌ Użycie: !compose GATUNEK [INSTRUMENT]")
-                    print(f"   Dostępne: {', '.join(list_genres()[:5])}...")
+                    print("❌ Użycie: !compose GATUNEK [INSTRUMENT] [TONIKA]")
+                    print(f"   Z generatorem: {', '.join(sorted(SoulComposerV59.GENERATED_GENRES))}")
                     print(f"   Instrumenty: {', '.join(list_instrument_names())}")
                     continue
                 
                 genre = parts[1].upper()
-                instr = parts[2] if len(parts) > 2 else None
+                instr, tonic = _parse_compose_tail(parts[2:])
                 
                 try:
-                    paths = session.compose(genre, instrument=instr)
+                    paths = session.compose(genre, instrument=instr, tonic=tonic)
                     print("\n" + "="*60)
-                    print(f"✅ SKOMPONOWANO: {genre}" + (f" ({instr})" if instr else ""))
+                    label = genre
+                    if instr:
+                        label += f" ({instr})"
+                    if tonic:
+                        label += f" [{tonic}]"
+                    print(f"✅ SKOMPONOWANO: {label}")
                     print("="*60)
                     for key, path in paths.items():
                         if path: print(f"  {key.upper():4}: {path}")
@@ -162,11 +258,14 @@ def _command_loop(session, core):
                 session.learn_web(parts[1], parts[2])
             
             elif cmd == "!file":
-                if len(parts) < 2: print("❌ Użycie: !file ścieżka"); continue
-                session.learn_file(parts[1])
+                path = command_path(parts)
+                if not path:
+                    print("❌ Użycie: !file ścieżka")
+                    continue
+                session.learn_file(path)
 
             elif cmd == "!play":
-                _play_command(parts[1] if len(parts) > 1 else None)
+                _play_command(command_path(parts))
 
             elif cmd == "!stop":
                 from midi_windows import stop_midi
@@ -176,14 +275,21 @@ def _command_loop(session, core):
                     print("Nic nie jest odtwarzane.")
             
             elif cmd == "!genres":
-                print("\n📚 DOSTĘPNE GATUNKI:")
+                print("\n📚 KATALOG GATUNKÓW:")
                 print("-"*60)
+                generated = SoulComposerV59.GENERATED_GENRES
                 for name in sorted(list_genres()):
-                    info = GENRE_DEFINITIONS[name]
+                    info = get_genre_info(name)
+                    if not info:
+                        continue
                     aff = info['f_intencja_wektor'].get('affections', 0)
                     mood = "💎+" if aff > 0 else ("💎-" if aff < 0 else "💎0")
-                    print(f"  {name:<16} {mood}  {info['opis'][:40]}")
+                    ready = "generator" if name in generated else "katalog"
+                    print(f"  {name:<16} {mood}  [{ready:<9}] {info['opis'][:32]}")
                 print("-"*60 + "\n")
+
+            elif cmd == "!compositions":
+                session.visualizer.list_compositions()
             
             elif cmd == "!report": session.visualizer.create_complete_report()
             elif cmd == "!trajectory": session.visualizer.create_3d_trajectory()

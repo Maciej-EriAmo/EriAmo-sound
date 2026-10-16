@@ -15,7 +15,6 @@ import customtkinter as ctk
 import threading
 import queue
 import os
-import sys
 from pathlib import Path
 
 # WAŻNE: Ustawienie backendu matplotlib PRZED importem
@@ -23,9 +22,9 @@ import matplotlib
 matplotlib.use('Agg')  # Backend bez GUI - zapobiega konfliktom z Tkinter
 
 from amocore_v59 import AXES_LIST, EPHEMERAL_AXES
-from genre_definitions import list_genres
 from instruments import list_instrument_names
 from session import EriAmoSession
+from soul_composer_v59 import SoulComposerV59
 
 # Dark mode
 ctk.set_appearance_mode("Dark")
@@ -61,6 +60,9 @@ class EriAmoBrain(threading.Thread):
                 
                 elif cmd_type == 'ANALYZE':
                     self._handle_analyze(task)
+
+                elif cmd_type == 'LEARN_FILE':
+                    self._handle_learn_file(task)
                 
                 elif cmd_type == 'COMPOSE':
                     self._handle_compose(task)
@@ -88,12 +90,24 @@ class EriAmoBrain(threading.Thread):
     def _handle_analyze(self, task):
         """Obsługa analizy utworu."""
         title = task['title']
-        features = list(task['features'])  # Kopia
+        features = []
+        seen = set()
+        for feature in list(task['features']):
+            key = str(feature).upper()
+            if key in seen:
+                continue
+            seen.add(key)
+            features.append(feature)
         
         if task.get('artist'):
             try:
                 web_features = self.session.loader.get_context_from_web(task['artist'], title)
-                features.extend(web_features or [])
+                for feature in web_features or []:
+                    key = str(feature).upper()
+                    if key in seen:
+                        continue
+                    seen.add(key)
+                    features.append(feature)
             except Exception as e:
                 self.resp_queue.put({"status": "LOG", "msg": f"Web: {e}"})
         
@@ -101,12 +115,25 @@ class EriAmoBrain(threading.Thread):
         self.session.teach(features, title, mode=mode)
         self.resp_queue.put({"status": "LOG", "msg": f"Analiza: {title}"})
 
+    def _handle_learn_file(self, task):
+        """Nauka z plików nutowych: dusza i pamięć wysokości."""
+        paths = task.get("paths") or []
+        if not paths:
+            self.resp_queue.put({"status": "ERROR", "msg": "Brak pliku do nauki."})
+            return
+        for path in paths:
+            features, note_memory = self.session.learn_file(path)
+            line = self.session._learning_line(features, note_memory)
+            status = "LOG" if features or note_memory else "ERROR"
+            self.resp_queue.put({"status": status, "msg": line})
+
     def _handle_compose(self, task):
         """Obsługa kompozycji."""
         genre = task['genre']
         instrument = task.get('instrument', None)  # Opcjonalny instrument
+        tonic = task.get('tonic') or None
         try:
-            paths = self.session.compose(genre, instrument=instrument)
+            paths = self.session.compose(genre, instrument=instrument, tonic=tonic)
             self.resp_queue.put({
                 "status": "SUCCESS", 
                 "msg": f"Skomponowano {genre}!" + (f" ({instrument})" if instrument else ""), 
@@ -313,11 +340,20 @@ class EriAmoApp(ctk.CTk):
             width=150
         )
         btn_sim.pack(side="left", padx=8)
+
+        btn_file = ctk.CTkButton(
+            btn_frame,
+            text="[T] NAUCZ Z PLIKU",
+            command=self._send_learn_file,
+            fg_color="#8e44ad",
+            width=180,
+        )
+        btn_file.pack(side="left", padx=8)
         
         # Info
         info = ctk.CTkLabel(
             frame, 
-            text="[E] Emocje wygasaja z czasem\n[T] Affections pozostaja jako pamieci gleboka",
+            text="[E] Emocje wygasaja z czasem\n[T] Affections pozostaja jako pamieci gleboka\nPlik MIDI albo MusicXML uczy takze pamiec nut",
             text_color="gray",
             font=ctk.CTkFont(size=11)
         )
@@ -336,7 +372,7 @@ class EriAmoApp(ctk.CTk):
         lbl.pack(pady=15)
         
         self.genre_var = ctk.StringVar(value="BLUES")
-        genres = list_genres()
+        genres = sorted(SoulComposerV59.GENERATED_GENRES)
         
         self.combo_genre = ctk.CTkComboBox(
             frame, 
@@ -364,6 +400,15 @@ class EriAmoApp(ctk.CTk):
             width=220
         )
         self.combo_instrument.pack(pady=5)
+
+        lbl_tonic = ctk.CTkLabel(
+            frame,
+            text="Tonika (opcjonalnie, np. G albo RIEPEL:G):",
+            font=ctk.CTkFont(size=12)
+        )
+        lbl_tonic.pack(pady=(15, 5))
+        self.entry_tonic = ctk.CTkEntry(frame, width=220, placeholder_text="C")
+        self.entry_tonic.pack(pady=5)
         
         btn_compose = ctk.CTkButton(
             frame, 
@@ -496,6 +541,23 @@ class EriAmoApp(ctk.CTk):
         })
         self._log(f"Wyslano: {title}...")
 
+    def _send_learn_file(self):
+        """Wybór jednego lub wielu plików nutowych."""
+        from tkinter import filedialog
+
+        paths = filedialog.askopenfilenames(
+            title="Pliki nutowe",
+            filetypes=[
+                ("MIDI i MusicXML", "*.mid *.midi *.musicxml *.xml *.mxl *.krn"),
+                ("Wszystkie pliki", "*.*"),
+            ],
+        )
+        if not paths:
+            return
+        self.cmd_queue.put({"type": "LEARN_FILE", "paths": list(paths)})
+        names = ", ".join(os.path.basename(path) for path in paths)
+        self._log(f"Nauka z pliku: {names}")
+
     def _play_windows_midi(self, paths):
         """Gra WAV kompozycji, a gdy go nie ma — MIDI."""
         if not paths:
@@ -539,20 +601,26 @@ class EriAmoApp(ctk.CTk):
         """Wysyła komendę kompozycji."""
         genre = self.genre_var.get()
         instrument = self.instrument_var.get()
+        tonic = self.entry_tonic.get().strip()
         
         # "Auto" oznacza brak wybranego instrumentu
         if instrument == "Auto":
             instrument = None
+        if not tonic:
+            tonic = None
         
         self.cmd_queue.put({
             'type': 'COMPOSE', 
             'genre': genre,
-            'instrument': instrument
+            'instrument': instrument,
+            'tonic': tonic,
         })
         
         msg = f"Komponuje: {genre}"
         if instrument:
             msg += f" ({instrument})"
+        if tonic:
+            msg += f" [{tonic}]"
         self._log(msg + "...")
 
     def _send_report(self):

@@ -19,6 +19,7 @@ from amocore_v59 import (
     AXES_LIST,
     compute_curiosity_from_soul,
     get_curiosity_engine,
+    get_ethics_check,
     get_music_memory,
     interpret_improv_for_composition,
     under_home,
@@ -27,14 +28,14 @@ from composer_genres import GenreMixin
 from composer_menuet import MenuetMixin
 from composer_runtime import AUDIO_AVAIL, MUSIC21_AVAIL, PYDUB_AVAIL
 from composer_score import ScoreMixin
-from genre_definitions import GENRE_DEFINITIONS, list_genres
+from genre_definitions import GENRE_DEFINITIONS, get_genre_info, get_genres_by_mood
 from instruments import normalize_instrument
 
 if not MUSIC21_AVAIL:
     print("[COMPOSER] Music21 niedostępne - tylko eksport tekstowy")
 if not AUDIO_AVAIL:
-    print("[COMPOSER] Brak midi2audio - zostaje sam zapis MIDI")
-elif not PYDUB_AVAIL:
+    print("[COMPOSER] Brak midi2audio. WAV i tak może zrobić EriAmo-midi, a gdy jest w PATH — fluidsynth.")
+if not PYDUB_AVAIL:
     print("[COMPOSER] Brak pydub - zostaje WAV, bez OGG/FLAC")
 
 
@@ -67,6 +68,7 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
         "E": 64, "F": 65, "F#": 66, "Gb": 66, "G": 67, "G#": 68,
         "Ab": 68, "A": 69, "A#": 70, "Bb": 70, "B": 71,
     }
+    PITCH_NAMES = ["C", "C#", "D", "Eb", "E", "F", "F#", "G", "Ab", "A", "Bb", "B"]
 
     def __init__(self, core, logger):
         self.core = core
@@ -78,7 +80,7 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
     def _get_soul_metrics(self) -> dict:
         """Metryki duszy, styl z pamięci i aktualna ciekawość."""
         soul = self.core.get_vector_copy()
-        improv_value = soul[self.AXES_MAP["improwizacja"]]
+        improv_value = self.core.get_improv_level()
         improv_params = interpret_improv_for_composition(improv_value)
 
         try:
@@ -92,6 +94,7 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
             memory_status = {}
 
         curiosity = compute_curiosity_from_soul(self.core)
+        risk = curiosity.get("recommendation", {}).get("risk_tolerance", 0.3)
         return {
             "logika": soul[self.AXES_MAP["logika"]],
             "emocje": soul[self.AXES_MAP["emocje"]],
@@ -106,6 +109,7 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
             "memory_style": memory_style,
             "memory_status": memory_status,
             "curiosity": curiosity,
+            "risk_tolerance": float(risk),
         }
 
     def _get_rhythm_duration(self, metrics: dict, base_tempo_mod: float = 0.0) -> float:
@@ -305,12 +309,20 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
         zanim dusza albo pliki zostaną zmienione.
         """
         genre_name, instrument_override = self._normalize_request(genre_name, instrument_override)
+        if not get_ethics_check(genre_name):
+            raise ValueError("To polecenie jest poza szkieletem etycznym.")
         self._require_generator(genre_name)
 
         curiosity_before = compute_curiosity_from_soul(self.core)
         recommendation = curiosity_before.get("recommendation", {})
-        if recommendation.get("action") in ("EXPLORE", "REVOLUTIONIZE"):
-            suggestion = get_curiosity_engine().suggest_new_genre(genre_name, list_genres())
+        if recommendation.get("suggest_genre_change") or recommendation.get("action") == "EXPLORE":
+            info = get_genre_info(genre_name) or {}
+            affection = info.get("f_intencja_wektor", {}).get("affections", 0)
+            mood = set(get_genres_by_mood(affection > 0)) if affection else set()
+            candidates = [name for name in sorted(self.GENERATED_GENRES) if name != genre_name and (not mood or name in mood)]
+            if not candidates:
+                candidates = [name for name in sorted(self.GENERATED_GENRES) if name != genre_name]
+            suggestion = get_curiosity_engine().suggest_new_genre(genre_name, candidates)
             self.core.log(
                 f"[CIEKAWOŚĆ] {curiosity_before.get('description', '')}. "
                 f"{recommendation.get('message', '')} Propozycja: {suggestion}.",
@@ -329,11 +341,11 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
         elif genre_name == "ROCK_AND_ROLL":
             data = self._generate_rock_polyphonic()
         elif genre_name == "MENUET":
-            tonic_midi = 60
-            if tonic:
-                tonic_midi = self.TONIC_MAP.get(tonic.upper().strip(), 60)
-            if tonic and tonic.upper() == "RIEPEL":
-                data = self._generate_menuet_polyphonic(tonic=60)
+            requested = (tonic or "").upper().strip()
+            key_name = requested.split(":", 1)[1] if requested.startswith("RIEPEL:") else requested
+            tonic_midi = self.TONIC_MAP.get(key_name, 60)
+            if requested == "RIEPEL" or requested.startswith("RIEPEL:"):
+                data = self._generate_menuet_polyphonic(tonic=tonic_midi)
             else:
                 data = self._generate_menuet_mozart_dice(tonic=tonic_midi)
         elif genre_name == "WALC":
@@ -345,12 +357,19 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
         elif genre_name == "AMBIENT":
             data = self._generate_ambient_polyphonic()
         else:
-            data = self._generate_simple_poly(genre_name)
+            known = ", ".join(sorted(self.GENERATED_GENRES))
+            raise ValueError(
+                f"Gatunek {genre_name} jest w katalogu, ale nie ma generatora. "
+                f"Kompozycja dostępna dla: {known}"
+            )
 
         score = self._create_music21_score(data, genre_name, instrument_override)
 
         timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
-        tonic_suffix = f"_{tonic}" if tonic and genre_name == "MENUET" else ""
+        tonic_suffix = ""
+        if tonic and genre_name == "MENUET":
+            safe_tonic = tonic.upper().replace(":", "_").replace(" ", "_")
+            tonic_suffix = f"_{safe_tonic}"
         base = f"{self.OUTPUT_DIR}/{genre_name}{tonic_suffix}_{timestamp}"
         paths = {"midi": None, "xml": None, "txt": None}
 
@@ -359,17 +378,28 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
             score.write("midi", fp=paths["midi"])
             paths["xml"] = f"{base}.musicxml"
             score.write("musicxml", fp=paths["xml"])
-            if AUDIO_AVAIL:
-                paths.update(self._render_audio(paths["midi"]))
+            paths.update(self._render_audio(paths["midi"]))
 
         paths["txt"] = f"{base}.txt"
         with open(paths["txt"], "w", encoding="utf-8") as handle:
             handle.write(f"Gatunek: {genre_name}\n")
-            if tonic and genre_name == "MENUET":
-                handle.write(f"Tonacja: {tonic}-dur\n")
+            structure = data.get("structure") or {}
+            if genre_name == "MENUET":
+                tonic_midi = structure.get("tonic")
+                if isinstance(tonic_midi, int):
+                    name = self.PITCH_NAMES[tonic_midi % 12]
+                    mode_name = "moll" if structure.get("is_minor") else "dur"
+                    handle.write(f"Tonacja: {name} {mode_name}\n")
+                form = str(structure.get("form", ""))
+                handle.write(f"Forma: {form}\n")
             handle.write(f"Instrument: {instrument_override if instrument_override else 'Auto'}\n")
             handle.write(f"Data: {datetime.datetime.now().isoformat()}\n\n")
-            if genre_name == "MENUET":
+            if genre_name == "MENUET" and "Würfelspiel" in str(structure.get("form", "")):
+                handle.write("STRUKTURA (Mozart, gra w kości):\n------------------------------\n")
+                handle.write("  16 taktów, część A i część B, każda z powtórzeniem.\n")
+                handle.write("  Numer z tablicy wybiera jeden z 176 zapisanych taktów.\n")
+                handle.write("  Forma: :||: A :||: B :||\n\n")
+            elif genre_name == "MENUET":
                 handle.write("STRUKTURA (Riepel):\n------------------------------\n")
                 handle.write("  Część A (Satz):\n")
                 handle.write("    t.1-4: Vordersatz → półkadencja (V)\n")
@@ -385,7 +415,8 @@ class SoulComposerV59(MenuetMixin, GenreMixin, ScoreMixin):
                 handle.write("  Metrum: 3/4\n\n")
             elif genre_name == "KANON":
                 handle.write("STRUKTURA:\n------------------------------\n")
-                handle.write("  Kanon w oktawie. Drugi głos wchodzi po 2 taktach.\n\n")
+                handle.write("  Kanon w oktawie. Drugi głos wchodzi po 2 taktach\n")
+                handle.write("  i powtarza osiem taktów tematu. Ostatnie dwa takty to koda prowadzącego.\n\n")
             handle.write("STAN DUSZY:\n------------------------------\n")
             soul = self.core.get_vector_copy()
             for i, axis in enumerate(AXES_LIST):

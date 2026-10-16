@@ -134,8 +134,14 @@ class ExternalKnowledgeLoader:
         }
         for genre in genre_list:
             g = str(genre).lower()
-            for k, v in mapping.items():
-                if k in g: features.update(v)
+            matched = [key for key in mapping if key in g]
+            kept = []
+            for key in matched:
+                covered = any(key != other and key in other and other in g for other in matched)
+                if not covered:
+                    kept.append(key)
+            for key in kept:
+                features.update(mapping[key])
         return list(features)
 
     def get_context_from_web(self, artist_name: str, track_title: str) -> list:

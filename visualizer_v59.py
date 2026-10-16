@@ -13,7 +13,7 @@ import os
 import base64
 from io import BytesIO
 from datetime import datetime
-from amocore_v59 import AXES_LIST, EPHEMERAL_AXES, PERSISTENT_AXES, under_home
+from amocore_v59 import AXES_LIST, EPHEMERAL_AXES, under_home
 
 try:
     import plotly.graph_objects as go
@@ -443,6 +443,26 @@ class SoulVisualizerV59:
         return paths
 
     # ============= LISTA KOMPOZYCJI =============
+    def _composition_name(self, filename: str) -> dict:
+        """Skleja tokeny nazwy aż do znacznika YYYYMMDD i odcina znany gatunek."""
+        stem = filename[:-4] if filename.lower().endswith(".mid") else filename
+        tokens = stem.split("_")
+        date_at = next(
+            (index for index, token in enumerate(tokens) if len(token) == 8 and token.isdigit()),
+            None,
+        )
+        head = tokens[:date_at] if date_at is not None else tokens
+        name = "_".join(head) if head else "?"
+        from genre_definitions import list_genres
+        genre = name
+        variant = ""
+        for candidate in sorted(list_genres(), key=len, reverse=True):
+            if name == candidate or name.startswith(candidate + "_"):
+                genre = candidate
+                variant = name[len(candidate):].strip("_")
+                break
+        return {"genre": genre, "variant": variant}
+
     def list_compositions(self) -> list:
         """Wyświetla listę kompozycji."""
         comp_dir = under_home("compositions")
@@ -460,9 +480,11 @@ class SoulVisualizerV59:
         print("="*60)
         
         for i, f in enumerate(files, 1):
-            parts = f.replace('.mid', '').split('_')
+            label = self._composition_name(f)
             print(f"{i}. {f}")
-            print(f"   Gatunek: {parts[0] if parts else '?'}")
+            print(f"   Gatunek: {label['genre']}")
+            if label["variant"]:
+                print(f"   Wariant: {label['variant']}")
             print(f"   Ścieżka: {os.path.join(comp_dir, f)}")
             print("-"*60)
         

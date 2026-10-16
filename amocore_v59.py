@@ -87,6 +87,74 @@ def finite_float(value):
         return None
     return number
 
+
+# Klasy wysokości i tryb nie są odcinkiem 0–1. Średnia arytmetyczna myli sąsiadów (C z H).
+_CIRCULAR_FEATURES = ("key_tonic", "dominant_pitch_class", "second_pitch_class")
+
+
+def _unit_to_pc(value):
+    """0–1 zapisane jako pc/11 wraca do klasy 0–11. Zły zapis daje None."""
+    number = finite_float(value)
+    if number is None:
+        return None
+    return int(round(number * 11.0)) % 12
+
+
+def _circular_mean(pairs):
+    """Średnia kątowa par (klasa wysokości, waga). Wynik znowu w skali 0–1."""
+    if not pairs:
+        return None
+    sin_sum = 0.0
+    cos_sum = 0.0
+    for pitch_class, weight in pairs:
+        angle = 2.0 * math.pi * (int(pitch_class) % 12) / 12.0
+        sin_sum += weight * math.sin(angle)
+        cos_sum += weight * math.cos(angle)
+    if abs(sin_sum) < 1e-12 and abs(cos_sum) < 1e-12:
+        pitch_class = int(pairs[0][0]) % 12
+    else:
+        angle = math.atan2(sin_sum, cos_sum) % (2.0 * math.pi)
+        pitch_class = int(round(angle / (2.0 * math.pi) * 12.0)) % 12
+    return pitch_class / 11.0
+
+
+def _mode_vote(pairs):
+    """Dur albo moll. Remis zostawia pierwszy głos, a nie 0.5, które potem uchodzi za dur."""
+    if not pairs:
+        return None
+    score = 0.0
+    total = 0.0
+    first = None
+    for value, weight in pairs:
+        bit = 1.0 if float(value) >= 0.5 else 0.0
+        if first is None:
+            first = bit
+        score += bit * weight
+        total += weight
+    if total <= 0:
+        return first
+    ratio = score / total
+    if abs(ratio - 0.5) <= 1e-9:
+        return first
+    return 1.0 if ratio > 0.5 else 0.0
+
+
+def _blend_mode(left, right, left_weight):
+    """Głosowanie dwóch już rozstrzygniętych trybów. Remis idzie za świeższym."""
+    def bit(value):
+        number = finite_float(value)
+        if number is None:
+            return None
+        return 1.0 if number >= 0.5 else 0.0
+
+    recent_bit = bit(left)
+    older_bit = bit(right)
+    if recent_bit is None:
+        return older_bit
+    if older_bit is None:
+        return recent_bit
+    return _mode_vote(((recent_bit, left_weight), (older_bit, 1.0 - left_weight)))
+
 # =============================================================================
 # DEFINICJA ONTOLOGICZNA: 9 WEKTORÓW DUSZY
 # =============================================================================
@@ -200,6 +268,7 @@ class MusicMemory:
         """
         os.makedirs(self.DATA_DIR, exist_ok=True)
         self._lock = threading.RLock()
+        self._wake = threading.Event()
         
         # Warstwa 1: Doświadczenia (lista słowników)
         self.H_log = []
@@ -261,8 +330,13 @@ class MusicMemory:
             try:
                 kept = self.H_log[-1000:]
                 dropped = len(self.H_log) - len(kept)
-                stored_index = max(0, min(len(kept), self._consolidated_index - dropped))
-                _atomic_write_json(self.H_LOG_PATH, kept)
+                if dropped > 0:
+                    self.H_log = kept
+                    self._consolidated_index = max(0, self._consolidated_index - dropped)
+                self._consolidated_index = max(0, min(self._consolidated_index, len(self.H_log)))
+                self.experiences_since_sleep = len(self.H_log) - self._consolidated_index
+                stored_index = self._consolidated_index
+                _atomic_write_json(self.H_LOG_PATH, self.H_log)
                 _atomic_write_json(self.D_MAP_PATH, {
                     "version": 2,
                     "consolidated_index": stored_index,
@@ -275,7 +349,8 @@ class MusicMemory:
         """Uruchamia cykl snu w osobnym wątku."""
         def cycle():
             while self.running:
-                time.sleep(self.sleep_interval)
+                self._wake.wait(self.sleep_interval)
+                self._wake.clear()
                 if not self.running:
                     break
                 try:
@@ -425,11 +500,10 @@ class MusicMemory:
             
             self.H_log.append(experience)
             self.experiences_since_sleep += 1
-            
-            # Auto-sen jeśli dużo doświadczeń
+
+            # Sen robi wątek w tle. Wołanie go tutaj trzymało naukę pliku do 5 sekund.
             if self.experiences_since_sleep > 10:
-                print(f"\033[93m[MEMORY] Dużo nowych doświadczeń - wymuszam sen...\033[0m")
-                self._sleep()
+                self._wake.set()
     
     def _features_to_vector(self, features: dict) -> list:
         """Konwertuje cechy do wektora numerycznego."""
@@ -454,12 +528,32 @@ class MusicMemory:
             return {"has_data": False}
         
         consolidated = {f: 0.0 for f in self.MUSICAL_FEATURES}
-        
+        circular = {feat: [] for feat in _CIRCULAR_FEATURES}
+        modes = []
+
         for pattern in self.D_Map.values():
             weight_ratio = pattern['weight'] / total_weight
-            for feat, val in pattern.get('features', {}).items():
-                if feat in consolidated:
-                    consolidated[feat] += val * weight_ratio
+            features = pattern.get('features', {})
+            if not isinstance(features, dict):
+                continue
+            for feat, val in features.items():
+                if feat in circular:
+                    pitch_class = _unit_to_pc(val)
+                    if pitch_class is not None:
+                        circular[feat].append((pitch_class, weight_ratio))
+                elif feat == "key_mode":
+                    modes.append((val, weight_ratio))
+                elif feat in consolidated:
+                    number = finite_float(val)
+                    if number is not None:
+                        consolidated[feat] += number * weight_ratio
+        for feat, pairs in circular.items():
+            mean = _circular_mean(pairs)
+            if mean is not None:
+                consolidated[feat] = mean
+        mode = _mode_vote(modes)
+        if mode is not None:
+            consolidated["key_mode"] = mode
         consolidated["has_data"] = True
         return consolidated
     
@@ -478,11 +572,32 @@ class MusicMemory:
         
         recent = self.H_log[-5:]
         avg = {f: 0.0 for f in self.MUSICAL_FEATURES}
-        
+        circular = {feat: [] for feat in _CIRCULAR_FEATURES}
+        modes = []
+        share = 1.0 / len(recent)
+
         for exp in recent:
-            for feat, val in exp.get('features', {}).items():
-                if feat in avg:
-                    avg[feat] += val / len(recent)
+            features = exp.get('features', {})
+            if not isinstance(features, dict):
+                continue
+            for feat, val in features.items():
+                if feat in circular:
+                    pitch_class = _unit_to_pc(val)
+                    if pitch_class is not None:
+                        circular[feat].append((pitch_class, share))
+                elif feat == "key_mode":
+                    modes.append((val, share))
+                elif feat in avg:
+                    number = finite_float(val)
+                    if number is not None:
+                        avg[feat] += number * share
+        for feat, pairs in circular.items():
+            mean = _circular_mean(pairs)
+            if mean is not None:
+                avg[feat] = mean
+        mode = _mode_vote(modes)
+        if mode is not None:
+            avg["key_mode"] = mode
         avg["has_data"] = True
         return avg
     
@@ -511,10 +626,27 @@ class MusicMemory:
 
         blended = {"has_data": True}
         for feat in self.MUSICAL_FEATURES:
-            blended[feat] = (
-                recent_weight * recent.get(feat, 0.5) +
-                (1 - recent_weight) * consolidated.get(feat, 0.5)
-            )
+            if feat in _CIRCULAR_FEATURES:
+                blended[feat] = _circular_mean([
+                    pair for pair in (
+                        (_unit_to_pc(recent.get(feat)), recent_weight),
+                        (_unit_to_pc(consolidated.get(feat)), 1.0 - recent_weight),
+                    )
+                    if pair[0] is not None and pair[1] > 0
+                ])
+                if blended[feat] is None:
+                    blended[feat] = 0.0
+            elif feat == "key_mode":
+                blended[feat] = _blend_mode(
+                    recent.get(feat), consolidated.get(feat), recent_weight
+                )
+                if blended[feat] is None:
+                    blended[feat] = 1.0
+            else:
+                blended[feat] = (
+                    recent_weight * recent.get(feat, 0.5) +
+                    (1 - recent_weight) * consolidated.get(feat, 0.5)
+                )
         return blended
     
     def force_sleep(self):
@@ -536,6 +668,7 @@ class MusicMemory:
     
     def shutdown(self):
         """Zatrzymuje cykl snu, scala zaległe doświadczenia i zapisuje pamięć."""
+        self._wake.set()
         with self._lock:
             self.running = False
             self.is_sleeping = False
@@ -693,8 +826,12 @@ def _learning_features_from_score(score) -> dict:
     else:
         features['second_pitch_class'] = features['dominant_pitch_class']
     
-    # 11. Gęstość chromatyki (nuty poza skalą diatoniczną C-dur/a-moll)
-    diatonic = {0, 2, 4, 5, 7, 9, 11}  # C, D, E, F, G, A, B
+    # 11. Gęstość chromatyki względem wykrytej tonacji, nie zawsze C-dur.
+    if key_mode >= 0.5:
+        degree_steps = (0, 2, 4, 5, 7, 9, 11)
+    else:
+        degree_steps = (0, 2, 3, 5, 7, 8, 10)
+    diatonic = {(int(key_tonic) + step) % 12 for step in degree_steps}
     chromatic_count = sum(1 for p in pitch_classes if p not in diatonic)
     features['chromatic_density'] = chromatic_count / len(pitch_classes) if pitch_classes else 0.0
     
@@ -1093,11 +1230,22 @@ class EriAmoCore:
                 if not math.isfinite(float(old_val)):
                     self.vector.values[idx] = 0.0
                     continue
-                decay_factor = (1 - config['rate']) ** cycles
+                half_life = finite_float(config.get("half_life"))
+                if half_life and half_life > 0:
+                    decay_factor = 0.5 ** (cycles / half_life)
+                else:
+                    decay_factor = (1 - config['rate']) ** cycles
                 new_val = old_val * decay_factor
-                if config['floor'] is not None:
-                    if old_val > 0: new_val = max(new_val, config['floor'])
-                    else: new_val = min(new_val, -config['floor'])
+                floor = config.get("floor")
+                if floor is not None:
+                    if old_val > 0:
+                        new_val = max(new_val, floor)
+                    elif old_val < 0:
+                        new_val = min(new_val, -floor)
+                ceiling = config.get("ceiling")
+                if ceiling is not None:
+                    cap = abs(float(ceiling))
+                    new_val = max(-cap, min(cap, new_val))
                 if abs(new_val) < 0.01: new_val = 0.0
                 self.vector.values[idx] = new_val
             self.decay_cycle_count += cycles
@@ -1330,7 +1478,6 @@ class CuriosityEngine:
         # Gaussowska krzywa: maksimum przy WIEDZA_OPTIMUM
         wiedza_norm = self._normalize(wiedza) * 100
         wiedza_diff = abs(wiedza_norm - self.WIEDZA_OPTIMUM)
-        import math
         wiedza_component = 100 * math.exp(-(wiedza_diff ** 2) / (2 * self.WIEDZA_SPREAD ** 2))
         
         # === Składnik EMOCJE ===
@@ -1408,9 +1555,7 @@ class CuriosityEngine:
         
         if was_novel:
             self.discovery_cooldown = 0
-        elif self.discovery_cooldown is None:
-            self.discovery_cooldown = 1
-        else:
+        elif self.discovery_cooldown is not None:
             self.discovery_cooldown += 1
     
     def register_discovery(self):
